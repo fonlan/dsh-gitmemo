@@ -381,6 +381,108 @@ test("recent-context injection seeds new root sessions with recent memory titles
   assert.equal(subContexts.length, 0);
 });
 
+test("end-signal reminder: user end phrase injects a firm reminder into that session", async () => {
+  const mod = await import("../lib/index.js");
+  const eventHandlers = {};
+  const sections = [];
+  const agent = {
+    id: "sess-1",
+    session: { header: { cwd: "/tmp/x", delegationDepth: 0 } },
+    ctx: { systemPrompt: { section: (section) => sections.push(section) } }
+  };
+  const ctx = {
+    tools: { register: () => {} },
+    skills: { register: () => {} },
+    systemPrompt: { section: () => {} },
+    on: (event, handler) => { eventHandlers[event] = handler; },
+    agents: { get: (id) => (id === "sess-1" ? agent : undefined) },
+    logger: { warn: (msg) => { throw new Error("unexpected warn: " + msg); } }
+  };
+  await mod.apply(ctx, { memDirName: ".mem" });
+
+  const userMessage = (text) => ({ type: "user/message", data: { role: "user", content: [{ type: "text", text }] } });
+
+  // end phrase (Chinese) -> reminder registered
+  eventHandlers["session/event"]({ id: "sess-1" }, userMessage("没有其他任务了，今天就到这里吧"));
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].name, "memory:gitmemo-endcheck");
+  assert.match(sections[0].text, /write ALL pending memories now with mem_write/);
+
+  // dedup: a second end message does not re-register
+  eventHandlers["session/event"]({ id: "sess-1" }, userMessage("no more tasks, that's all"));
+  assert.equal(sections.length, 1);
+
+  // English end phrase on a fresh session -> reminder registered
+  const sections2 = [];
+  const agent2 = {
+    id: "sess-2",
+    session: { header: { cwd: "/tmp/x", delegationDepth: 0 } },
+    ctx: { systemPrompt: { section: (section) => sections2.push(section) } }
+  };
+  const ctx2 = {
+    tools: { register: () => {} }, skills: { register: () => {} }, systemPrompt: { section: () => {} },
+    on: (event, handler) => { eventHandlers[event] = handler; },
+    agents: { get: (id) => (id === "sess-2" ? agent2 : undefined) },
+    logger: { warn: (msg) => { throw new Error("unexpected warn: " + msg); } }
+  };
+  await mod.apply(ctx2, { memDirName: ".mem" });
+  eventHandlers["session/event"]({ id: "sess-2" }, userMessage("that's all for today, bye"));
+  assert.equal(sections2.length, 1);
+
+  // non-end message -> nothing
+  const sections3 = [];
+  const agent3 = {
+    id: "sess-3",
+    session: { header: { cwd: "/tmp/x", delegationDepth: 0 } },
+    ctx: { systemPrompt: { section: (section) => sections3.push(section) } }
+  };
+  const ctx3 = {
+    tools: { register: () => {} }, skills: { register: () => {} }, systemPrompt: { section: () => {} },
+    on: (event, handler) => { eventHandlers[event] = handler; },
+    agents: { get: (id) => (id === "sess-3" ? agent3 : undefined) },
+    logger: { warn: (msg) => { throw new Error("unexpected warn: " + msg); } }
+  };
+  await mod.apply(ctx3, { memDirName: ".mem" });
+  eventHandlers["session/event"]({ id: "sess-3" }, userMessage("请修复登录接口的 bug"));
+  assert.equal(sections3.length, 0);
+  // tool-result style message (no plain text blocks) -> nothing
+  eventHandlers["session/event"]({ id: "sess-3" }, { type: "user/message", data: { role: "user", content: [{ type: "tool-result", tool: "bash" }] } });
+  assert.equal(sections3.length, 0);
+  // non user/message event -> nothing
+  eventHandlers["session/event"]({ id: "sess-3" }, { type: "turn/end", data: {} });
+  assert.equal(sections3.length, 0);
+});
+
+test("end-signal reminder: subagents skipped, and endSignalReminder=false disables the listener", async () => {
+  const mod = await import("../lib/index.js");
+  const eventHandlers = {};
+  const sections = [];
+  const sub = {
+    id: "sub-1",
+    session: { header: { cwd: "/tmp/x", delegationDepth: 1 } },
+    ctx: { systemPrompt: { section: (section) => sections.push(section) } }
+  };
+  const ctx = {
+    tools: { register: () => {} }, skills: { register: () => {} }, systemPrompt: { section: () => {} },
+    on: (event, handler) => { eventHandlers[event] = handler; },
+    agents: { get: (id) => (id === "sub-1" ? sub : undefined) },
+    logger: { warn: () => {} }
+  };
+  await mod.apply(ctx, { memDirName: ".mem" });
+  eventHandlers["session/event"]({ id: "sub-1" }, { type: "user/message", data: { role: "user", content: [{ type: "text", text: "no more tasks" }] } });
+  assert.equal(sections.length, 0);
+
+  const handlers2 = {};
+  const ctx2 = {
+    tools: { register: () => {} }, skills: { register: () => {} }, systemPrompt: { section: () => {} },
+    on: (event, handler) => { handlers2[event] = handler; },
+    agents: { get: () => undefined },
+    logger: { warn: () => {} }
+  };
+  await mod.apply(ctx2, { memDirName: ".mem", endSignalReminder: false });
+  assert.equal(handlers2["session/event"], undefined);
+});
+
 test("recent-context injection: no .mem repo -> no context, no repo created", async () => {
   const root = makeRepo(); // project repo without any .mem yet
   const mod = await import("../lib/index.js");

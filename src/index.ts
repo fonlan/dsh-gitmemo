@@ -35,6 +35,8 @@ const Config = z.object({
   branchAlign: z.boolean().default(true),
   /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
   recentContextLimit: z.number().default(5),
+  /** Inject a firm end-of-session reminder when the user signals the conversation is ending. Default true. */
+  endSignalReminder: z.boolean().default(true),
   /** Optional explicit project root; defaults to the calling session's cwd. */
   projectRoot: z.string()
 });
@@ -44,6 +46,7 @@ interface ResolvedConfig {
   searchLimit: number;
   branchAlign: boolean;
   recentContextLimit: number;
+  endSignalReminder: boolean;
   projectRoot?: string;
 }
 
@@ -345,8 +348,122 @@ interface CreatedAgent {
   id: string;
   session?: { header?: { cwd?: string; delegationDepth?: number } };
   ctx: {
-    systemPrompt: { context(section: { name: string; order: number; text: string }): unknown };
+    systemPrompt: {
+      context(section: { name: string; order: number; text: string }): unknown;
+      section(section: { name: string; order: number; text: string }): unknown;
+    };
   };
+}
+
+/** English end-of-session phrases (word-boundary matched). */
+const EN_END_PATTERNS = [
+  /\bno more tasks?\b/i,
+  /\bthat'?s all\b/i,
+  /\bthat'?s it\b/i,
+  /\bwe'?re done\b/i,
+  /\bwe are done\b/i,
+  /\ball done\b/i,
+  /\bgoodbye\b/i,
+  /\bbye\b/i,
+  /\bwrap(?:ping)? (?:it )?up\b/i,
+  /\bend of (?:the )?(?:session|day)\b/i,
+  /\bfinish(?:ed|ing)? up\b/i,
+  /\bstop here\b/i
+];
+
+/** Chinese end-of-session phrases (substring matched). */
+const CN_END_PHRASES = [
+  "没有其他任务",
+  "没有别的任务",
+  "没有其他事了",
+  "没有别的事了",
+  "没别的了",
+  "没别的事了",
+  "今天就到这",
+  "今天就到这里",
+  "结束了",
+  "收工",
+  "再见",
+  "拜拜",
+  "就这些",
+  "没了",
+  "没有更多任务"
+];
+
+/** Firm reminder injected when the user signals the conversation is ending. */
+const END_CHECK_TEXT =
+  "The user signaled that the conversation is ending. Before answering, check whether any completed repo-related task still needs a gitmemo memory, and write ALL pending memories now with mem_write. Then give your final summary.";
+
+/** Whether a user message signals the end of the conversation. */
+function isEndSignal(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (EN_END_PATTERNS.some((pattern) => pattern.test(lower))) return true;
+  return CN_END_PHRASES.some((phrase) => lower.includes(phrase));
+}
+
+/** Extract plain text from a session message (role/content-block shape). */
+function messageText(data: unknown): string {
+  if (typeof data === "string") return data.trim();
+  if (typeof data !== "object" || data === null) return "";
+  const content = (data as { content?: unknown }).content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (typeof block === "object" && block !== null) {
+      const b = block as { type?: unknown; text?: unknown };
+      if (b.type === "text" && typeof b.text === "string" && b.text.trim().length > 0) {
+        parts.push(b.text);
+      }
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+/** Shape of a session event observed from the host. */
+interface SessionEvent {
+  type?: string;
+  data?: unknown;
+}
+
+/**
+ * End-of-session safety net: when the user signals the conversation is
+ * ending ("no more tasks", "that's all", "今天就到这", ...), inject a firm
+ * reminder into that session's prompt so pending memories are written before
+ * the model wraps up. Mitigates the model forgetting the checkpoint rule.
+ */
+function registerEndCheck(
+  ctx: {
+    on(event: string, handler: (...args: any[]) => void): unknown;
+    agents?: { get(id: string): CreatedAgent | undefined };
+    logger: { warn(message: string): void };
+  },
+  config: ResolvedConfig
+): void {
+  if (!config.endSignalReminder) return;
+  const reminded = new Set<string>();
+  ctx.on("session/event", (rawSession, rawEvent) => {
+    const session = rawSession as { id: string };
+    const event = rawEvent as SessionEvent | undefined;
+    if (event?.type !== "user/message") return;
+    if (reminded.has(session.id)) return;
+    const text = messageText(event.data);
+    if (text.length === 0 || !isEndSignal(text)) return;
+    const agent = ctx.agents?.get(session.id);
+    if (agent === undefined) return;
+    const header = agent.session?.header;
+    if ((header?.delegationDepth ?? 0) > 0) return;
+    reminded.add(session.id);
+    try {
+      agent.ctx.systemPrompt.section({
+        name: "memory:gitmemo-endcheck",
+        order: 400,
+        text: END_CHECK_TEXT
+      });
+    } catch (error) {
+      ctx.logger.warn(`dsh-gitmemo: end-check reminder failed for session "${session.id}": ${String(error)}`);
+    }
+  });
 }
 
 /**
@@ -393,7 +510,8 @@ async function apply(ctx: {
   tools: { register(tool: unknown): unknown };
   skills: { register(skill: RuntimeSkill): unknown };
   systemPrompt: { section(section: { name: string; order: number; text: string }): unknown };
-  on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown;
+  on(event: string, handler: (...args: any[]) => void): unknown;
+  agents?: { get(id: string): CreatedAgent | undefined };
   logger: { warn(message: string): void };
 }, config: Partial<ResolvedConfig> = {}): Promise<void> {
   const resolved: ResolvedConfig = {
@@ -401,11 +519,13 @@ async function apply(ctx: {
     searchLimit: config.searchLimit ?? 20,
     branchAlign: config.branchAlign ?? true,
     recentContextLimit: config.recentContextLimit ?? 5,
+    endSignalReminder: config.endSignalReminder ?? true,
     projectRoot: config.projectRoot
   };
   registerMemTools(ctx, resolved);
   registerPromptSection(ctx);
   registerRecentContext(ctx, resolved);
+  registerEndCheck(ctx, resolved);
   await registerSkill(ctx);
 }
 

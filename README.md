@@ -60,8 +60,9 @@ The bundle patch ships with sensible defaults; override them in the profile's
     memDirName: .mem       # memory repo directory name at the project root
     searchLimit: 20        # max hits per mem_search call
     branchAlign: true      # .mem branch follows the project branch on write
-    recentContextLimit: 5  # recent memory titles injected into each new session's system prompt (0 disables)
-    projectRoot: null      # optional explicit project root (defaults to the session cwd)
+    recentContextLimit: 5   # recent memory titles injected into each new session's system prompt (0 disables)
+    endSignalReminder: true # firm end-of-session reminder when the user signals the conversation is ending
+    projectRoot: null       # optional explicit project root (defaults to the session cwd)
 ```
 
 ## Memory Location
@@ -83,9 +84,12 @@ The plugin does NOT leave memory usage to chance:
 - **Tools** — `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` are registered in every agent's tool catalog.
 - **Always-on rules** — the complete workflow rules (below) are a system-prompt section in every session, equivalent to gitmemo's `agents-template.md`; the model cannot miss them.
 - **Session-start seed** — each new root session's system prompt automatically includes the most recent memory titles (configurable via `recentContextLimit`), so cross-session continuity is visible before any tool call. The lookup is read-only: it never creates `.mem`, and subagents are skipped.
+- **End-of-session safety net** — when the user signals the conversation is ending ("no more tasks", "that's all", "今天就到这", ...), a firm reminder is injected into that session's prompt requiring all pending memories to be written before wrapping up. This directly mitigates the model forgetting the checkpoint rule. Detectable phrases cover common English and Chinese closings; one reminder per session; subagents are skipped. Can be disabled with `endSignalReminder: false`.
 - **Skill** — the `gitmemo` skill remains loadable on demand as the complete reference (argument contract, entry format, search semantics).
 
-What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. What is NOT hookable: dsh has no reliable "conversation ended" event (`session/disposed` only fires when a session is deleted), so end-of-session writes are enforced by the always-on checkpoint rule, exactly like the original skill.
+What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. What is NOT hookable: if the user walks away without any closing signal, no event fires and nothing can trigger a write — the always-on checkpoint rule and the end-signal reminder cover every detectable ending.
+
+> Tip: add `.mem/` to your project's `.gitignore` so the memory repository never mixes into project commits.
 
 ## Agent Workflow (always-on rules)
 

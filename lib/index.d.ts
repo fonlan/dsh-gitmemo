@@ -13,6 +13,8 @@ declare const Config: z<Schemastery.ObjectS<{
     branchAlign: z<boolean, boolean>;
     /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
     recentContextLimit: z<number, number>;
+    /** Inject a firm end-of-session reminder when the user signals the conversation is ending. Default true. */
+    endSignalReminder: z<boolean, boolean>;
     /** Optional explicit project root; defaults to the calling session's cwd. */
     projectRoot: z<string, string>;
 }>, Schemastery.ObjectT<{
@@ -24,6 +26,8 @@ declare const Config: z<Schemastery.ObjectS<{
     branchAlign: z<boolean, boolean>;
     /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
     recentContextLimit: z<number, number>;
+    /** Inject a firm end-of-session reminder when the user signals the conversation is ending. Default true. */
+    endSignalReminder: z<boolean, boolean>;
     /** Optional explicit project root; defaults to the calling session's cwd. */
     projectRoot: z<string, string>;
 }>>;
@@ -32,6 +36,7 @@ interface ResolvedConfig {
     searchLimit: number;
     branchAlign: boolean;
     recentContextLimit: number;
+    endSignalReminder: boolean;
     projectRoot?: string;
 }
 interface RuntimeSkill {
@@ -61,6 +66,11 @@ interface CreatedAgent {
                 order: number;
                 text: string;
             }): unknown;
+            section(section: {
+                name: string;
+                order: number;
+                text: string;
+            }): unknown;
         };
     };
 }
@@ -83,9 +93,10 @@ declare function apply(ctx: {
             text: string;
         }): unknown;
     };
-    on(event: string, handler: (payload: {
-        agent: CreatedAgent;
-    }) => void): unknown;
+    on(event: string, handler: (...args: any[]) => void): unknown;
+    agents?: {
+        get(id: string): CreatedAgent | undefined;
+    };
     logger: {
         warn(message: string): void;
     };
