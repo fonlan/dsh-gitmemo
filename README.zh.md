@@ -1,5 +1,7 @@
 # dsh-gitmemo
 
+[**English**](README.md) | **简体中文**
+
 **基于 Git 的 DeepSeek Harness (dsh) 长期记忆插件** —— 一个镜像
 [GitMemo](https://github.com/fonlan/gitmemo) 功能的 Cordis 插件。Agent 会把已完成任务的结论以
 markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库，并在开始新任务前先搜索既往记忆。唯一依赖
@@ -22,12 +24,12 @@ markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库，并在开�
 | 内容 | 说明 |
 | --- | --- |
 | `mem_init` | 初始化 `.mem` 仓库（其余工具都会自动初始化） |
-| `mem_search` | 搜索记忆：`keywords`（逗号分隔）、`skip`（分页）、`mode`（`and` / `or` / `auto`，auto 先 AND 后 OR 兜底）。每次最多返回 20 条 `hash|title|date` |
+| `mem_search` | 搜索记忆：`keywords`（逗号分隔）、`skip`（分页）、`mode`（`and` / `or` / `auto`，auto 先 AND 后 OR 兜底）。每次最多返回 20 条 `hash\|title\|date` |
 | `mem_read` | 按提交哈希读取一条记忆的完整 markdown |
 | `mem_write` | 存储任务结论：`title` + `content`（或 `content_file` / `file`），可选 `body` / `body_file`。提交为 `.mem/entries/<时间戳>-<slug>.md` 并对齐 `.mem` 分支 |
 | `mem_delete` | 按提交哈希删除记忆条目（然后重做并重写） |
 | 常驻规则片段 | 完整工作流规则（相当于 gitmemo 的 `agents-template.md`）注入**每个**会话的系统提示词——无需加载技能即可生效 |
-| 会话开始注入 | 每个新**根** Agent 会话开始时，自动把最近 N 条记忆标题（`hash|title|date`）注入该系统提示词，跨会话上下文在调用任何工具前即可见；子代理被跳过，且该查询只读、绝不创建 `.mem` |
+| 会话开始注入 | 每个新**根** Agent 会话开始时，自动把最近 N 条记忆标题（`hash\|title\|date`）注入该系统提示词，跨会话上下文在调用任何工具前即可见；子代理被跳过，且该查询只读、绝不创建 `.mem` |
 
 ## 安装
 
@@ -36,7 +38,7 @@ markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库，并在开�
 从 npm 仓库（发布后）：
 
 ```bash
-dsh plugin --profile web add dsh-gitmemo
+dsh plugin --profile web add @fonlan/dsh-gitmemo
 ```
 
 从本地源码目录（开发/未发布）：
@@ -73,16 +75,6 @@ git -C .mem log --oneline
 git -C .mem show <commit-hash>
 ```
 
-## 记忆如何被强制执行
-
-插件不会把记忆使用完全交给运气：
-
-- **工具** —— `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` 注册进每个 Agent 的工具目录。
-- **常驻规则** —— 完整工作流规则（见下）是每个会话系统提示词中的固定片段（相当于 gitmemo 的 `agents-template.md`），模型不可能错过；每个 mem_* 工具的描述自带参数契约。
-- **会话开始注入** —— 每个新根会话的系统提示词自动包含最近记忆标题（`recentContextLimit` 可配置），跨会话连续性在任何工具调用前即可见。查询只读：绝不创建 `.mem`，子代理被跳过。
-
-仍由模型判断的部分：关键词的选择、是否 `mem_read` 某条命中——与原版 gitmemo 一致。会话结束检查点是**感知驱动**的：只要模型判断对话在收尾（包括隐含收尾，比如最后一句"谢谢，搞定！"——已实测生效），就会触发写入。唯一覆盖不到的情况：用户一句话不说直接离开——模型拿不到下一个回合，没有任何机会执行写入（dsh 没有"会话结束"事件，`session/disposed` 只在会话被删除时触发）。
-
 > 提示：建议把 `.mem/` 加入项目的 `.gitignore`，避免记忆仓库混入项目提交。
 
 ## Agent 工作流（常驻规则）
@@ -90,11 +82,10 @@ git -C .mem show <commit-hash>
 1. **开工前 —— 搜索。** 从请求中提取 3-5 个关键词 → `mem_search`。若相关结果超过 5 条，只
    `mem_read` 最可能相关的 5 条。无相关结果时用 `skip` 20、40… 翻页。
 2. **用户不满意 —— 删除重写。** `mem_delete <hash>` → 按反馈重做 → `mem_write` 更正后的条目。
-3. **会话结束检查点 —— 唯一的写入路径。** 用户说"没有其他任务了"、"就这样"、或对话即将结束时，
-   回顾整个会话，用 `mem_write` 写入**每一条**已完成、与仓库相关、且结论**有价值/可复用**（或用户
-   明确要求记住）但还没有记忆的任务。绝不重复写已存在的条目；若已存结论已过时，先 `mem_delete`
-   再写更正条目。纯问答、未完成任务、与仓库无关的工作、纯操作性的 git 动作一律不写。关闭会话前
-   写完所有待写记忆。
+3. **会话结束检查点 —— 唯一的写入路径。** 对话即将结束时，回顾整个会话，用 `mem_write` 写入
+   **每一条**已完成、与仓库相关、且结论**有价值/可复用**（或用户明确要求记住）但还没有记忆的任务。
+   绝不重复写已存在的条目；若已存结论已过时，先 `mem_delete` 再写更正条目。纯问答、未完成任务、
+   与仓库无关的工作、纯操作性的 git 动作一律不写。关闭会话前写完所有待写记忆。
 
 ## 条目格式
 

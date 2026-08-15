@@ -1,5 +1,7 @@
 # dsh-gitmemo
 
+**English** | [**简体中文**](README.zh.md)
+
 **Git-backed long-term memory for DeepSeek Harness (dsh)** — a Cordis plugin mirroring
 [GitMemo](https://github.com/fonlan/gitmemo). The agent stores completed task outcomes as
 markdown entries in a local **`.mem`** Git repository and searches them before starting new
@@ -22,12 +24,12 @@ work. Git is the only dependency, and no manual memory commands are ever needed.
 | Piece | Description |
 | --- | --- |
 | `mem_init` | Initialize the `.mem` repository (all other tools auto-initialize) |
-| `mem_search` | Search memories: `keywords` (comma-separated), `skip` (pagination), `mode` (`and` / `or` / `auto` — AND first, OR fallback). Returns up to 20 hits as `hash|title|date` |
+| `mem_search` | Search memories: `keywords` (comma-separated), `skip` (pagination), `mode` (`and` / `or` / `auto` — AND first, OR fallback). Returns up to 20 hits as `hash\|title\|date` |
 | `mem_read` | Read one memory entry by commit hash (full markdown) |
 | `mem_write` | Store a task outcome: `title` + `content` (or `content_file` / `file`), optional `body` / `body_file`. Commits `.mem/entries/<timestamp>-<slug>.md` and aligns the `.mem` branch |
 | `mem_delete` | Delete a memory entry by commit hash (then redo and rewrite) |
 | Always-on rules section | The complete workflow rules (gitmemo's `agents-template.md` equivalent) are injected into **every** session's system prompt — no skill load needed |
-| Session-start injection | On every new **root** agent session, the N most recent memory titles (`hash|title|date`) are automatically injected into that session's system prompt, so prior-session context is visible before any tool call; subagents are skipped and the lookup never creates `.mem` |
+| Session-start injection | On every new **root** agent session, the N most recent memory titles (`hash\|title\|date`) are automatically injected into that session's system prompt, so prior-session context is visible before any tool call; subagents are skipped and the lookup never creates `.mem` |
 
 ## Installation
 
@@ -36,7 +38,7 @@ Requires dsh ≥ 0.1.0-rc.6 and the `git` CLI.
 From the npm registry (once published):
 
 ```bash
-dsh plugin --profile web add dsh-gitmemo
+dsh plugin --profile web add @fonlan/dsh-gitmemo
 ```
 
 From a local checkout (development / unpublished):
@@ -75,16 +77,6 @@ git -C .mem log --oneline
 git -C .mem show <commit-hash>
 ```
 
-## How Memory Is Enforced
-
-The plugin does NOT leave memory usage to chance:
-
-- **Tools** — `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` are registered in every agent's tool catalog.
-- **Always-on rules** — the complete workflow rules (below) are a system-prompt section in every session, equivalent to gitmemo's `agents-template.md`; the model cannot miss them. The mem_* tool descriptions carry the argument contract for each operation.
-- **Session-start seed** — each new root session's system prompt automatically includes the most recent memory titles (configurable via `recentContextLimit`), so cross-session continuity is visible before any tool call. The lookup is read-only: it never creates `.mem`, and subagents are skipped.
-
-What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. The end-of-session checkpoint is perception-driven: the model applies it whenever it judges the conversation is ending, including implied endings (e.g. a final "thanks, done!") — verified in practice. The only uncovered case is the user abandoning the session with no final message at all: the model never gets another turn, so nothing can be written (dsh has no "conversation ended" event — `session/disposed` only fires when a session is deleted).
-
 > Tip: add `.mem/` to your project's `.gitignore` so the memory repository never mixes into project commits.
 
 ## Agent Workflow (always-on rules)
@@ -94,13 +86,12 @@ What stays with the model's judgment: keyword choice and whether to `mem_read` a
    20, 40, … when nothing relevant appears.
 2. **User unsatisfied — delete and rewrite.** `mem_delete <hash>` → redo from feedback →
    `mem_write` a corrected entry.
-3. **End-of-session checkpoint — the only write path.** When the user says "no more tasks" /
-   "that's all" / the conversation is ending, review the whole session and `mem_write` EVERY
-   completed repo-related task that still lacks a memory and whose outcome is **valuable/reusable**
-   (or was explicitly asked to be remembered). Never duplicate an already-written entry; if a
-   stored outcome is outdated, `mem_delete` it first, then write the corrected entry. Never
-   write for pure Q&A, incomplete tasks, non-repo work, or purely operational git actions.
-   Write all pending memories before closing the conversation.
+3. **End-of-session checkpoint — the only write path.** When the conversation is ending, review
+   the whole session and `mem_write` every completed repo-related task that still lacks a memory
+   and whose outcome is **valuable/reusable** (or was explicitly asked to be remembered). Never
+   duplicate an already-written entry; if a stored outcome is outdated, `mem_delete` it first,
+   then write the corrected entry. Never write for pure Q&A, incomplete tasks, non-repo work, or
+   purely operational git actions. Write all pending memories before closing the conversation.
 
 ## Entry Format
 
