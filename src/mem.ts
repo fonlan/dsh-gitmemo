@@ -84,7 +84,9 @@ function git(dir: string, args: string[], timeoutMs: number): Promise<string> {
 /** Synchronous git runner for the session-start injection path (must not race the first prompt assembly). */
 function gitSync(dir: string, args: string[], timeoutMs: number): string {
   try {
-    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs });
+    // stdio must be pinned: execFileSync forwards child stderr to the parent's
+    // console unless stdio is set, leaking raw `git fatal:` noise at boot.
+    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs, stdio: "pipe" });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {

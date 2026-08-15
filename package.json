@@ -1,6 +1,6 @@
 {
   "name": "@fonlan/dsh-gitmemo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Git-backed long-term memory for DeepSeek Harness: a local .mem git repo with mem_search / mem_read / mem_write / mem_delete tools, auto-managed by the agent with zero manual steps.",
   "author": "fonlan",
   "publishConfig": {
