@@ -59,9 +59,8 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
     memDirName: .mem       # 项目根目录下记忆仓库的目录名
     searchLimit: 20        # 每次 mem_search 返回的最大条数
     branchAlign: true      # 写入时 .mem 分支跟随项目分支
-    recentContextLimit: 5   # 注入每个新会话系统提示词的最近记忆条数（0 表示关闭）
-    endSignalReminder: true # 用户示意会话结束时注入强提醒
-    projectRoot: null       # 可选：显式项目根目录（默认取会话工作目录）
+    recentContextLimit: 5  # 注入每个新会话系统提示词的最近记忆条数（0 表示关闭）
+    projectRoot: null      # 可选：显式项目根目录（默认取会话工作目录）
 ```
 
 ## 记忆存放位置
@@ -82,10 +81,9 @@ git -C .mem show <commit-hash>
 - **工具** —— `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` 注册进每个 Agent 的工具目录。
 - **常驻规则** —— 完整工作流规则（见下）是每个会话系统提示词中的固定片段（相当于 gitmemo 的 `agents-template.md`），模型不可能错过。
 - **会话开始注入** —— 每个新根会话的系统提示词自动包含最近记忆标题（`recentContextLimit` 可配置），跨会话连续性在任何工具调用前即可见。查询只读：绝不创建 `.mem`，子代理被跳过。
-- **会话结束安全网** —— 当用户示意会话结束（"no more tasks"、"that's all"、"今天就到这"……）时，向该会话提示词注入一条强提醒，要求收尾前写入所有待写记忆，直接降低模型忘记检查点规则的概率。覆盖中英文常见结束语；每会话只提醒一次；子代理跳过；可用 `endSignalReminder: false` 关闭。
 - **技能** —— `gitmemo` 技能仍可按需加载，作为完整参考（参数契约、条目格式、搜索语义）。
 
-仍由模型判断的部分：关键词的选择、是否 `mem_read` 某条命中——与原版 gitmemo 一致。无法挂钩的部分：若用户没有任何结束语直接离开，不会有任何事件触发写入——常驻检查点规则与结束语提醒覆盖所有可检测的结束场景。
+仍由模型判断的部分：关键词的选择、是否 `mem_read` 某条命中——与原版 gitmemo 一致。无法挂钩的部分：dsh 没有可靠的"会话结束"事件（`session/disposed` 只在会话被删除时触发），因此会话结束写入由常驻的检查点规则强制执行，与原版技能的做法相同。
 
 > 提示：建议把 `.mem/` 加入项目的 `.gitignore`，避免记忆仓库混入项目提交。
 
