@@ -317,9 +317,11 @@ test("plugin module: exports, config schema, and tool registration on a stub ctx
   assert.equal(sections.length, 1);
   assert.equal(sections[0].name, "memory:gitmemo");
   assert.match(sections[0].text, /BEFORE WORK/);
-  assert.match(sections[0].text, /AFTER COMPLETION/);
+  assert.doesNotMatch(sections[0].text, /AFTER COMPLETION/);
   assert.match(sections[0].text, /USER UNSATISFIED/);
   assert.match(sections[0].text, /END-OF-SESSION CHECKPOINT/);
+  assert.match(sections[0].text, /the ONLY write path/);
+  assert.match(sections[0].text, /Never duplicate an already-written entry/);
 
   // recent-context injection is wired to agent/created
   assert.equal(typeof eventHandlers["agent/created"], "function");

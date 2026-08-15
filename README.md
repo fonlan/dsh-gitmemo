@@ -92,13 +92,15 @@ What stays with the model's judgment: keyword choice and whether to `mem_read` a
 1. **Before work — search.** Extract 3-5 keywords from the request → `mem_search`. If more
    than 5 hits are relevant, read only the 5 most likely (`mem_read`). Paginate with `skip`
    20, 40, … when nothing relevant appears.
-2. **After completion — write.** `mem_write` only when the task is **complete**, **repo-related**,
-   and the outcome is **valuable/reusable** (or the user explicitly asked to remember). Never
-   write for pure Q&A, incomplete tasks, non-repo work, or purely operational git actions.
-3. **User unsatisfied — delete and rewrite.** `mem_delete <hash>` → redo from feedback →
+2. **User unsatisfied — delete and rewrite.** `mem_delete <hash>` → redo from feedback →
    `mem_write` a corrected entry.
-4. **End-of-session checkpoint.** When the user says "no more tasks" / "that's all", write any
-   pending memories before closing the conversation.
+3. **End-of-session checkpoint — the only write path.** When the user says "no more tasks" /
+   "that's all" / the conversation is ending, review the whole session and `mem_write` EVERY
+   completed repo-related task that still lacks a memory and whose outcome is **valuable/reusable**
+   (or was explicitly asked to be remembered). Never duplicate an already-written entry; if a
+   stored outcome is outdated, `mem_delete` it first, then write the corrected entry. Never
+   write for pure Q&A, incomplete tasks, non-repo work, or purely operational git actions.
+   Write all pending memories before closing the conversation.
 
 ## Entry Format
 
