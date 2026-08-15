@@ -1,0 +1,60 @@
+{
+  "name": "dsh-gitmemo",
+  "version": "0.1.0",
+  "description": "Git-backed long-term memory for DeepSeek Harness: a local .mem git repo with mem_search / mem_read / mem_write / mem_delete tools, auto-managed by the agent with zero manual steps.",
+  "author": "fonlan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fonlan/dsh-gitmemo.git"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./mem": {
+      "types": "./lib/mem.d.ts",
+      "default": "./lib/mem.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test test/"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.5.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "memory",
+    "git",
+    "long-term-memory"
+  ],
+  "license": "MIT"
+}

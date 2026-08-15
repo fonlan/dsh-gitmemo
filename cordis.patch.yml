@@ -1,0 +1,14 @@
+# dsh-gitmemo — bundle patch layer.
+#
+# Installing this package into a profile (`dsh plugin --profile <name> add dsh-gitmemo`)
+# appends it to `dsh.profile.bundles`; this patch is then applied as that
+# bundle's layer. The row below loads the package's main entry as a host-plane
+# plugin: it registers the `mem_init` / `mem_search` / `mem_read` /
+# `mem_write` / `mem_delete` tools on the shared tool registry, a runtime
+# `gitmemo` skill, and a system-prompt section pointing at the memory workflow.
+- insert:
+    - id: dsh-gitmemo
+      name: dsh-gitmemo
+      config:
+        memDirName: .mem
+        searchLimit: 20
