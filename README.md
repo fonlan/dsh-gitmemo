@@ -83,7 +83,7 @@ The plugin does NOT leave memory usage to chance:
 - **Always-on rules** — the complete workflow rules (below) are a system-prompt section in every session, equivalent to gitmemo's `agents-template.md`; the model cannot miss them. The mem_* tool descriptions carry the argument contract for each operation.
 - **Session-start seed** — each new root session's system prompt automatically includes the most recent memory titles (configurable via `recentContextLimit`), so cross-session continuity is visible before any tool call. The lookup is read-only: it never creates `.mem`, and subagents are skipped.
 
-What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. What is NOT hookable: dsh has no reliable "conversation ended" event (`session/disposed` only fires when a session is deleted), so end-of-session writes are enforced by the always-on checkpoint rule, exactly like the original skill.
+What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. The end-of-session checkpoint is perception-driven: the model applies it whenever it judges the conversation is ending, including implied endings (e.g. a final "thanks, done!") — verified in practice. The only uncovered case is the user abandoning the session with no final message at all: the model never gets another turn, so nothing can be written (dsh has no "conversation ended" event — `session/disposed` only fires when a session is deleted).
 
 > Tip: add `.mem/` to your project's `.gitignore` so the memory repository never mixes into project commits.
 
