@@ -26,7 +26,6 @@ work. Git is the only dependency, and no manual memory commands are ever needed.
 | `mem_read` | Read one memory entry by commit hash (full markdown) |
 | `mem_write` | Store a task outcome: `title` + `content` (or `content_file` / `file`), optional `body` / `body_file`. Commits `.mem/entries/<timestamp>-<slug>.md` and aligns the `.mem` branch |
 | `mem_delete` | Delete a memory entry by commit hash (then redo and rewrite) |
-| `gitmemo` skill | Runtime skill with the full workflow rules (search before work, write after completion, delete+rewrite on dissatisfaction, end-of-session checkpoint) |
 | Always-on rules section | The complete workflow rules (gitmemo's `agents-template.md` equivalent) are injected into **every** session's system prompt — no skill load needed |
 | Session-start injection | On every new **root** agent session, the N most recent memory titles (`hash|title|date`) are automatically injected into that session's system prompt, so prior-session context is visible before any tool call; subagents are skipped and the lookup never creates `.mem` |
 
@@ -81,9 +80,8 @@ git -C .mem show <commit-hash>
 The plugin does NOT leave memory usage to chance:
 
 - **Tools** — `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` are registered in every agent's tool catalog.
-- **Always-on rules** — the complete workflow rules (below) are a system-prompt section in every session, equivalent to gitmemo's `agents-template.md`; the model cannot miss them.
+- **Always-on rules** — the complete workflow rules (below) are a system-prompt section in every session, equivalent to gitmemo's `agents-template.md`; the model cannot miss them. The mem_* tool descriptions carry the argument contract for each operation.
 - **Session-start seed** — each new root session's system prompt automatically includes the most recent memory titles (configurable via `recentContextLimit`), so cross-session continuity is visible before any tool call. The lookup is read-only: it never creates `.mem`, and subagents are skipped.
-- **Skill** — the `gitmemo` skill remains loadable on demand as the complete reference (argument contract, entry format, search semantics).
 
 What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. What is NOT hookable: dsh has no reliable "conversation ended" event (`session/disposed` only fires when a session is deleted), so end-of-session writes are enforced by the always-on checkpoint rule, exactly like the original skill.
 
@@ -139,7 +137,6 @@ dsh-gitmemo/
 ├── src/
 │   ├── index.ts          # Cordis plugin: mem_* tools + gitmemo skill + prompt section
 │   └── mem.ts            # core engine (port of gitmemo scripts/mem.sh)
-├── assets/gitmemo.md     # bundled skill body
 ├── lib/                  # built output (committed; used by file:/git installs)
 └── test/mem.test.mjs     # engine + plugin unit tests
 ```

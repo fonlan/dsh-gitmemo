@@ -26,7 +26,6 @@ markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库，并在开�
 | `mem_read` | 按提交哈希读取一条记忆的完整 markdown |
 | `mem_write` | 存储任务结论：`title` + `content`（或 `content_file` / `file`），可选 `body` / `body_file`。提交为 `.mem/entries/<时间戳>-<slug>.md` 并对齐 `.mem` 分支 |
 | `mem_delete` | 按提交哈希删除记忆条目（然后重做并重写） |
-| `gitmemo` 技能 | 运行时技能，含完整工作流规则（开工前搜索、完成后写入、不满意则删除重写、会话结束检查点） |
 | 常驻规则片段 | 完整工作流规则（相当于 gitmemo 的 `agents-template.md`）注入**每个**会话的系统提示词——无需加载技能即可生效 |
 | 会话开始注入 | 每个新**根** Agent 会话开始时，自动把最近 N 条记忆标题（`hash|title|date`）注入该系统提示词，跨会话上下文在调用任何工具前即可见；子代理被跳过，且该查询只读、绝不创建 `.mem` |
 
@@ -79,9 +78,8 @@ git -C .mem show <commit-hash>
 插件不会把记忆使用完全交给运气：
 
 - **工具** —— `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` 注册进每个 Agent 的工具目录。
-- **常驻规则** —— 完整工作流规则（见下）是每个会话系统提示词中的固定片段（相当于 gitmemo 的 `agents-template.md`），模型不可能错过。
+- **常驻规则** —— 完整工作流规则（见下）是每个会话系统提示词中的固定片段（相当于 gitmemo 的 `agents-template.md`），模型不可能错过；每个 mem_* 工具的描述自带参数契约。
 - **会话开始注入** —— 每个新根会话的系统提示词自动包含最近记忆标题（`recentContextLimit` 可配置），跨会话连续性在任何工具调用前即可见。查询只读：绝不创建 `.mem`，子代理被跳过。
-- **技能** —— `gitmemo` 技能仍可按需加载，作为完整参考（参数契约、条目格式、搜索语义）。
 
 仍由模型判断的部分：关键词的选择、是否 `mem_read` 某条命中——与原版 gitmemo 一致。无法挂钩的部分：dsh 没有可靠的"会话结束"事件（`session/disposed` 只在会话被删除时触发），因此会话结束写入由常驻的检查点规则强制执行，与原版技能的做法相同。
 
@@ -134,7 +132,6 @@ dsh-gitmemo/
 ├── src/
 │   ├── index.ts          # Cordis 插件：mem_* 工具 + gitmemo 技能 + 提示词片段
 │   └── mem.ts            # 核心引擎（gitmemo scripts/mem.sh 的移植）
-├── assets/gitmemo.md     # 内置技能正文
 ├── lib/                  # 构建产物（已提交，供 file:/git 安装使用）
 └── test/mem.test.mjs     # 引擎 + 插件单元测试
 ```

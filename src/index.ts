@@ -8,13 +8,11 @@
  * This plugin registers on the host plane:
  *  - five model-facing tools: `mem_init`, `mem_search`, `mem_read`,
  *    `mem_write`, `mem_delete` (backed by {@link GitMemo});
- *  - a runtime `gitmemo` skill describing the memory workflow;
- *  - a short system-prompt section pointing at the workflow.
+ *  - an always-on system-prompt section with the full memory workflow rules;
+ *  - a per-session seed of the most recent memory titles.
  *
  * @module dsh-gitmemo
  */
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { GitMemo, type GitMemoConfig } from "./mem.js";
@@ -23,7 +21,7 @@ import { GitMemo, type GitMemoConfig } from "./mem.js";
 const name = "dsh-gitmemo";
 
 /** Host services this plugin needs. */
-const inject = ["tools", "skills", "systemPrompt"];
+const inject = ["tools", "systemPrompt"];
 
 /** Plugin configuration (all optional). */
 const Config = z.object({
@@ -290,40 +288,11 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
   }));
 }
 
-interface RuntimeSkill {
-  name: string;
-  description: string;
-  invocation?: { modelInvocable: boolean; userInvocable: boolean };
-  provider?: string;
-  source?: string;
-  content: string;
-}
-
-/** Register the runtime gitmemo skill (body from assets/gitmemo.md). */
-async function registerSkill(ctx: { skills: { register(skill: RuntimeSkill): unknown }; logger: { warn(message: string): void } }): Promise<void> {
-  const skillUrl = new URL("../assets/gitmemo.md", import.meta.url);
-  let content: string;
-  try {
-    content = await readFile(fileURLToPath(skillUrl), "utf8");
-  } catch (error) {
-    ctx.logger.warn("dsh-gitmemo: failed to load skill body, skipping gitmemo skill: " + String(error));
-    return;
-  }
-  ctx.skills.register({
-    name: "gitmemo",
-    description:
-      "Long-term memory for coding agents via a local .mem git repo. Interfaces: mem_search, mem_read, mem_write, mem_delete. MUST be used when starting tasks (search past), after completing tasks (write), before/after context compression, or when the user mentions memory/.mem.",
-    invocation: { modelInvocable: true, userInvocable: true },
-    provider: "runtime",
-    source: "runtime",
-    content
-  });
-}
-
 /**
  * Register the always-on memory workflow rules (the equivalent of gitmemo's
- * agents-template.md). Unlike the on-demand gitmemo skill, this section is
- * part of every session's system prompt, so the rules cannot be missed.
+ * agents-template.md). This section is part of every session's system prompt,
+ * so the rules cannot be missed; the mem_* tool descriptions carry the
+ * argument contract for each operation.
  */
 function registerPromptSection(ctx: { systemPrompt: { section(section: { name: string; order: number; text: string }): unknown } }): void {
   ctx.systemPrompt.section({
@@ -334,8 +303,7 @@ function registerPromptSection(ctx: { systemPrompt: { section(section: { name: s
       "- BEFORE WORK — search: extract 3-5 keywords from the user request and run mem_search. If more than 5 relevant hits appear, select only the 5 most likely (keyword overlap, title specificity, recency) and mem_read only those; reuse their conclusions when appropriate. If nothing relevant, paginate with skip 20, 40, ...",
       "- AFTER COMPLETION — write: mem_write a memory ONLY when all of these hold: the task is complete, it is related to the current repository, and the outcome is valuable and reusable OR the user explicitly asked to remember it. Never write for pure Q&A, incomplete tasks, non-repo work, or purely operational git actions (commit/push only). Entry title: \"[module] action + object\"; content: markdown with YAML front matter (date, status, repo_branch, mem_branch, related_paths, tags) and Original User Request / AI Understanding / Final Outcome sections; optional short body (1-3 sentences, metadata only) — never memory content.",
       "- USER UNSATISFIED — delete and rewrite: mem_delete the entry's commit hash, redo the task from the feedback, then mem_write a corrected entry.",
-      "- END-OF-SESSION CHECKPOINT: when the user says \"no more tasks\", \"that's all\", or the conversation is ending, check whether any completed task still needs a memory and write all pending memories BEFORE closing the conversation.",
-      "The gitmemo skill carries the complete reference; load it when you need the full argument contract."
+      "- END-OF-SESSION CHECKPOINT: when the user says \"no more tasks\", \"that's all\", or the conversation is ending, check whether any completed task still needs a memory and write all pending memories BEFORE closing the conversation."
     ].join("\n")
   });
 }
@@ -385,13 +353,12 @@ function registerRecentContext(
 }
 
 /**
- * Register the plugin: tools, skill, and prompt section.
- * @param ctx - registrant context carrying the host tool/skill/prompt services.
+ * Register the plugin: tools, always-on rules, and session-start seed.
+ * @param ctx - registrant context carrying the host tool/prompt services.
  * @param config - plugin configuration (defaults applied by the loader).
  */
 async function apply(ctx: {
   tools: { register(tool: unknown): unknown };
-  skills: { register(skill: RuntimeSkill): unknown };
   systemPrompt: { section(section: { name: string; order: number; text: string }): unknown };
   on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown;
   logger: { warn(message: string): void };
@@ -406,7 +373,6 @@ async function apply(ctx: {
   registerMemTools(ctx, resolved);
   registerPromptSection(ctx);
   registerRecentContext(ctx, resolved);
-  await registerSkill(ctx);
 }
 
 export { Config, apply, inject, name };

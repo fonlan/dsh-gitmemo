@@ -285,17 +285,15 @@ test("works in a non-git directory (root fallback)", async () => {
 test("plugin module: exports, config schema, and tool registration on a stub ctx", async () => {
   const mod = await import("../lib/index.js");
   assert.equal(mod.name, "dsh-gitmemo");
-  assert.deepEqual(mod.inject, ["tools", "skills", "systemPrompt"]);
+  assert.deepEqual(mod.inject, ["tools", "systemPrompt"]);
   assert.ok(mod.Config, "Config schema exported");
   assert.equal(typeof mod.apply, "function");
 
   const registered = [];
   const sections = [];
-  const skills = [];
   const eventHandlers = {};
   const ctx = {
     tools: { register: (tool) => registered.push(tool) },
-    skills: { register: (skill) => skills.push(skill) },
     systemPrompt: { section: (section) => sections.push(section) },
     on: (event, handler) => { eventHandlers[event] = handler; },
     logger: { warn: () => {} }
@@ -314,13 +312,6 @@ test("plugin module: exports, config schema, and tool registration on a stub ctx
   assert.ok(search.parameters.required.includes("keywords"));
   assert.deepEqual(search.parameters.properties.mode.enum, ["and", "or", "auto"]);
   assert.equal(search.parameters.properties.keywords.type, "string");
-
-  assert.equal(skills.length, 1);
-  assert.equal(skills[0].name, "gitmemo");
-  assert.equal(skills[0].source, "runtime");
-  assert.equal(skills[0].provider, "runtime");
-  assert.match(skills[0].content, /mem_search/);
-  assert.match(skills[0].description, /MUST be used/);
 
   // The always-on rules section carries the full workflow (agents-template equivalent)
   assert.equal(sections.length, 1);
