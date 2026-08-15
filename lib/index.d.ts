@@ -11,6 +11,8 @@ declare const Config: z<Schemastery.ObjectS<{
     searchLimit: z<number, number>;
     /** Align the .mem branch with the project branch on writes. Default true. */
     branchAlign: z<boolean, boolean>;
+    /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
+    recentContextLimit: z<number, number>;
     /** Optional explicit project root; defaults to the calling session's cwd. */
     projectRoot: z<string, string>;
 }>, Schemastery.ObjectT<{
@@ -20,6 +22,8 @@ declare const Config: z<Schemastery.ObjectS<{
     searchLimit: z<number, number>;
     /** Align the .mem branch with the project branch on writes. Default true. */
     branchAlign: z<boolean, boolean>;
+    /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
+    recentContextLimit: z<number, number>;
     /** Optional explicit project root; defaults to the calling session's cwd. */
     projectRoot: z<string, string>;
 }>>;
@@ -27,6 +31,7 @@ interface ResolvedConfig {
     memDirName: string;
     searchLimit: number;
     branchAlign: boolean;
+    recentContextLimit: number;
     projectRoot?: string;
 }
 interface RuntimeSkill {
@@ -39,6 +44,25 @@ interface RuntimeSkill {
     provider?: string;
     source?: string;
     content: string;
+}
+/** Shape of the agent payload received by an `agent/created` listener. */
+interface CreatedAgent {
+    id: string;
+    session?: {
+        header?: {
+            cwd?: string;
+            delegationDepth?: number;
+        };
+    };
+    ctx: {
+        systemPrompt: {
+            context(section: {
+                name: string;
+                order: number;
+                text: string;
+            }): unknown;
+        };
+    };
 }
 /**
  * Register the plugin: tools, skill, and prompt section.
@@ -59,6 +83,9 @@ declare function apply(ctx: {
             text: string;
         }): unknown;
     };
+    on(event: string, handler: (payload: {
+        agent: CreatedAgent;
+    }) => void): unknown;
     logger: {
         warn(message: string): void;
     };

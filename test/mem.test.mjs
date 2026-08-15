@@ -247,6 +247,32 @@ test("search on an empty memory repo returns no results", async () => {
   assert.equal(found.mode, "or"); // auto: AND yields 0 < 3, falls back to OR
 });
 
+test("recentSync lists newest entries first, read-only", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
+  const first = await memo.write({ title: "[demo] first", content: "one" });
+  await sleep(20);
+  const second = await memo.write({ title: "[demo] second", content: "two" });
+  await sleep(20);
+  const third = await memo.write({ title: "[demo] third", content: "three" });
+
+  const hits = memo.recentSync(2);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].hash, third.hash);
+  assert.equal(hits[1].hash, second.hash);
+
+  // deleted entries do not appear
+  await memo.delete(third.hash);
+  const hits2 = memo.recentSync(5);
+  assert.deepEqual(hits2.map((h) => h.hash), [second.hash, first.hash]);
+
+  // no .mem repo -> empty, and no repo is created
+  const fresh = makeRepo();
+  const memo2 = new GitMemo(fresh);
+  assert.deepEqual(memo2.recentSync(5), []);
+  assert.ok(!existsSync(join(fresh, ".mem")));
+});
+
 test("works in a non-git directory (root fallback)", async () => {
   const root = mkdtempSync(join(tmpdir(), "gitmemo-nogit-"));
   dirs.push(root);
@@ -266,10 +292,12 @@ test("plugin module: exports, config schema, and tool registration on a stub ctx
   const registered = [];
   const sections = [];
   const skills = [];
+  const eventHandlers = {};
   const ctx = {
     tools: { register: (tool) => registered.push(tool) },
     skills: { register: (skill) => skills.push(skill) },
     systemPrompt: { section: (section) => sections.push(section) },
+    on: (event, handler) => { eventHandlers[event] = handler; },
     logger: { warn: () => {} }
   };
   await mod.apply(ctx, { memDirName: ".mem" });
@@ -294,6 +322,97 @@ test("plugin module: exports, config schema, and tool registration on a stub ctx
   assert.match(skills[0].content, /mem_search/);
   assert.match(skills[0].description, /MUST be used/);
 
+  // The always-on rules section carries the full workflow (agents-template equivalent)
   assert.equal(sections.length, 1);
   assert.equal(sections[0].name, "memory:gitmemo");
+  assert.match(sections[0].text, /BEFORE WORK/);
+  assert.match(sections[0].text, /AFTER COMPLETION/);
+  assert.match(sections[0].text, /USER UNSATISFIED/);
+  assert.match(sections[0].text, /END-OF-SESSION CHECKPOINT/);
+
+  // recent-context injection is wired to agent/created
+  assert.equal(typeof eventHandlers["agent/created"], "function");
+});
+
+test("recent-context injection seeds new root sessions with recent memory titles", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
+  const first = await memo.write({ title: "[demo] first memory", content: "one" });
+  await sleep(20);
+  const second = await memo.write({ title: "[demo] second memory", content: "two" });
+
+  const mod = await import("../lib/index.js");
+  const contexts = [];
+  const eventHandlers = {};
+  const ctx = {
+    tools: { register: () => {} },
+    skills: { register: () => {} },
+    systemPrompt: { section: () => {} },
+    on: (event, handler) => { eventHandlers[event] = handler; },
+    logger: { warn: (msg) => { throw new Error("unexpected warn: " + msg); } }
+  };
+  await mod.apply(ctx, { memDirName: ".mem", recentContextLimit: 5 });
+
+  // root agent: session cwd = the repo root
+  const rootAgent = {
+    id: "root-agent",
+    session: { header: { cwd: root } },
+    ctx: { systemPrompt: { context: (section) => contexts.push(section) } }
+  };
+  eventHandlers["agent/created"]({ agent: rootAgent });
+  await sleep(400); // async git lookup settles
+
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0].name, "memory:gitmemo-recent");
+  assert.match(contexts[0].text, new RegExp(second.hash));
+  assert.match(contexts[0].text, new RegExp(first.hash));
+  // newest first
+  assert.ok(contexts[0].text.indexOf(second.hash) < contexts[0].text.indexOf(first.hash));
+
+  // subagents (delegationDepth > 0) are skipped
+  const subContexts = [];
+  const sub = {
+    id: "sub-agent",
+    session: { header: { cwd: root, delegationDepth: 1 } },
+    ctx: { systemPrompt: { context: (section) => subContexts.push(section) } }
+  };
+  eventHandlers["agent/created"]({ agent: sub });
+  await sleep(200);
+  assert.equal(subContexts.length, 0);
+});
+
+test("recent-context injection: no .mem repo -> no context, no repo created", async () => {
+  const root = makeRepo(); // project repo without any .mem yet
+  const mod = await import("../lib/index.js");
+  const contexts = [];
+  const eventHandlers = {};
+  const ctx = {
+    tools: { register: () => {} },
+    skills: { register: () => {} },
+    systemPrompt: { section: () => {} },
+    on: (event, handler) => { eventHandlers[event] = handler; },
+    logger: { warn: () => {} }
+  };
+  await mod.apply(ctx, { memDirName: ".mem", recentContextLimit: 5 });
+  const agent = {
+    id: "fresh-agent",
+    session: { header: { cwd: root } },
+    ctx: { systemPrompt: { context: (section) => contexts.push(section) } }
+  };
+  eventHandlers["agent/created"]({ agent });
+  await sleep(400);
+  assert.equal(contexts.length, 0);
+  assert.ok(!existsSync(join(root, ".mem")), "session start must not create .mem");
+
+  // recentContextLimit 0 disables the hook entirely
+  const handlers2 = {};
+  const ctx2 = {
+    tools: { register: () => {} },
+    skills: { register: () => {} },
+    systemPrompt: { section: () => {} },
+    on: (event, handler) => { handlers2[event] = handler; },
+    logger: { warn: () => {} }
+  };
+  await mod.apply(ctx2, { memDirName: ".mem", recentContextLimit: 0 });
+  assert.equal(handlers2["agent/created"], undefined);
 });

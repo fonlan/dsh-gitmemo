@@ -33,6 +33,8 @@ const Config = z.object({
   searchLimit: z.number().default(20),
   /** Align the .mem branch with the project branch on writes. Default true. */
   branchAlign: z.boolean().default(true),
+  /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
+  recentContextLimit: z.number().default(5),
   /** Optional explicit project root; defaults to the calling session's cwd. */
   projectRoot: z.string()
 });
@@ -41,6 +43,7 @@ interface ResolvedConfig {
   memDirName: string;
   searchLimit: number;
   branchAlign: boolean;
+  recentContextLimit: number;
   projectRoot?: string;
 }
 
@@ -317,12 +320,67 @@ async function registerSkill(ctx: { skills: { register(skill: RuntimeSkill): unk
   });
 }
 
-/** Register a short system-prompt pointer to the memory workflow. */
+/**
+ * Register the always-on memory workflow rules (the equivalent of gitmemo's
+ * agents-template.md). Unlike the on-demand gitmemo skill, this section is
+ * part of every session's system prompt, so the rules cannot be missed.
+ */
 function registerPromptSection(ctx: { systemPrompt: { section(section: { name: string; order: number; text: string }): unknown } }): void {
   ctx.systemPrompt.section({
     name: "memory:gitmemo",
     order: 150,
-    text: "This deployment provides gitmemo long-term memory (.mem git repo, tools mem_search / mem_read / mem_write / mem_delete). Before starting work, search past memories with mem_search and reuse relevant conclusions. After completing a repo-related task whose outcome is valuable and reusable (or the user asked to remember it), store it with mem_write. Load the gitmemo skill for the full workflow."
+    text: [
+      "This deployment provides gitmemo long-term memory: a local .mem git repository at the project root stores past task outcomes as markdown entries; git is the only dependency. Use the dedicated tools only (mem_search / mem_read / mem_write / mem_delete — all auto-initialize); never shell out to git or read .mem files directly.",
+      "- BEFORE WORK — search: extract 3-5 keywords from the user request and run mem_search. If more than 5 relevant hits appear, select only the 5 most likely (keyword overlap, title specificity, recency) and mem_read only those; reuse their conclusions when appropriate. If nothing relevant, paginate with skip 20, 40, ...",
+      "- AFTER COMPLETION — write: mem_write a memory ONLY when all of these hold: the task is complete, it is related to the current repository, and the outcome is valuable and reusable OR the user explicitly asked to remember it. Never write for pure Q&A, incomplete tasks, non-repo work, or purely operational git actions (commit/push only). Entry title: \"[module] action + object\"; content: markdown with YAML front matter (date, status, repo_branch, mem_branch, related_paths, tags) and Original User Request / AI Understanding / Final Outcome sections; optional short body (1-3 sentences, metadata only) — never memory content.",
+      "- USER UNSATISFIED — delete and rewrite: mem_delete the entry's commit hash, redo the task from the feedback, then mem_write a corrected entry.",
+      "- END-OF-SESSION CHECKPOINT: when the user says \"no more tasks\", \"that's all\", or the conversation is ending, check whether any completed task still needs a memory and write all pending memories BEFORE closing the conversation.",
+      "The gitmemo skill carries the complete reference; load it when you need the full argument contract."
+    ].join("\n")
+  });
+}
+
+/** Shape of the agent payload received by an `agent/created` listener. */
+interface CreatedAgent {
+  id: string;
+  session?: { header?: { cwd?: string; delegationDepth?: number } };
+  ctx: {
+    systemPrompt: { context(section: { name: string; order: number; text: string }): unknown };
+  };
+}
+
+/**
+ * Seed every new ROOT agent session with the most recent memory titles.
+ * Registered into the agent's own scope, so the block joins only that
+ * session's prompt; subagents (delegationDepth > 0) are skipped, the lookup
+ * is read-only (no .mem auto-init), and failures degrade to a log warning.
+ */
+function registerRecentContext(
+  ctx: { on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown; logger: { warn(message: string): void } },
+  config: ResolvedConfig
+): void {
+  if (config.recentContextLimit <= 0) return;
+  ctx.on("agent/created", ({ agent }) => {
+    const header = agent.session?.header;
+    if (header?.cwd === undefined || (header.delegationDepth ?? 0) > 0) return;
+    try {
+      // Synchronous scan: registers the context before the first request assembles.
+      const memo = new GitMemo(config.projectRoot ?? header.cwd, {
+        memDirName: config.memDirName,
+        searchLimit: config.searchLimit,
+        branchAlign: config.branchAlign
+      });
+      const hits = memo.recentSync(config.recentContextLimit);
+      if (hits.length === 0) return;
+      const lines = hits.map((hit) => hit.hash + "|" + hit.title + "|" + hit.date);
+      agent.ctx.systemPrompt.context({
+        name: "memory:gitmemo-recent",
+        order: 400,
+        text: "Recent gitmemo memories from previous sessions (mem_read <hash> for details, mem_search for targeted lookups):\n" + lines.join("\n")
+      });
+    } catch (error) {
+      ctx.logger.warn(`dsh-gitmemo: recent-memory injection skipped for agent "${agent.id}": ${String(error)}`);
+    }
   });
 }
 
@@ -335,16 +393,19 @@ async function apply(ctx: {
   tools: { register(tool: unknown): unknown };
   skills: { register(skill: RuntimeSkill): unknown };
   systemPrompt: { section(section: { name: string; order: number; text: string }): unknown };
+  on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown;
   logger: { warn(message: string): void };
 }, config: Partial<ResolvedConfig> = {}): Promise<void> {
   const resolved: ResolvedConfig = {
     memDirName: config.memDirName ?? ".mem",
     searchLimit: config.searchLimit ?? 20,
     branchAlign: config.branchAlign ?? true,
+    recentContextLimit: config.recentContextLimit ?? 5,
     projectRoot: config.projectRoot
   };
   registerMemTools(ctx, resolved);
   registerPromptSection(ctx);
+  registerRecentContext(ctx, resolved);
   await registerSkill(ctx);
 }
 

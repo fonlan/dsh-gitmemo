@@ -68,6 +68,22 @@ export declare class GitMemo {
      */
     search(keywords: string, skip?: number, mode?: "and" | "or" | "auto"): Promise<SearchResult>;
     private runSearchMode;
+    /**
+     * List the most recent memory entries across all branches, newest first.
+     * Used to seed a new session's system prompt with a compact overview.
+     * @param limit - maximum number of entries to return (0 returns none).
+     */
+    recent(limit: number): Promise<SearchHit[]>;
+    /** Active (non-deleted) entry files at HEAD. */
+    private activeEntries;
+    /** Shared git-log scan: keyword-grep optional, active-entry filtering, skip/limit. */
+    private scanLog;
+    /**
+     * Synchronous variant of {@link recent} for the session-start injection
+     * path: blocks until the memory repo is scanned so the system-prompt
+     * context can be registered before the first request assembles.
+     */
+    recentSync(limit: number): SearchHit[];
     private acceptRecord;
     /** Resolve the entry file touched by a commit (first file under entries/). */
     private entryFileFromCommit;

@@ -27,7 +27,8 @@ work. Git is the only dependency, and no manual memory commands are ever needed.
 | `mem_write` | Store a task outcome: `title` + `content` (or `content_file` / `file`), optional `body` / `body_file`. Commits `.mem/entries/<timestamp>-<slug>.md` and aligns the `.mem` branch |
 | `mem_delete` | Delete a memory entry by commit hash (then redo and rewrite) |
 | `gitmemo` skill | Runtime skill with the full workflow rules (search before work, write after completion, delete+rewrite on dissatisfaction, end-of-session checkpoint) |
-| System-prompt section | A short pointer so every session knows memory tools exist |
+| Always-on rules section | The complete workflow rules (gitmemo's `agents-template.md` equivalent) are injected into **every** session's system prompt — no skill load needed |
+| Session-start injection | On every new **root** agent session, the N most recent memory titles (`hash|title|date`) are automatically injected into that session's system prompt, so prior-session context is visible before any tool call; subagents are skipped and the lookup never creates `.mem` |
 
 ## Installation
 
@@ -56,10 +57,11 @@ The bundle patch ships with sensible defaults; override them in the profile's
 ```yaml
 - id: dsh-gitmemo
   config:
-    memDirName: .mem      # memory repo directory name at the project root
-    searchLimit: 20       # max hits per mem_search call
-    branchAlign: true     # .mem branch follows the project branch on write
-    projectRoot: null     # optional explicit project root (defaults to the session cwd)
+    memDirName: .mem       # memory repo directory name at the project root
+    searchLimit: 20        # max hits per mem_search call
+    branchAlign: true      # .mem branch follows the project branch on write
+    recentContextLimit: 5  # recent memory titles injected into each new session's system prompt (0 disables)
+    projectRoot: null      # optional explicit project root (defaults to the session cwd)
 ```
 
 ## Memory Location
@@ -74,7 +76,18 @@ git -C .mem log --oneline
 git -C .mem show <commit-hash>
 ```
 
-## Agent Workflow (from the bundled skill)
+## How Memory Is Enforced
+
+The plugin does NOT leave memory usage to chance:
+
+- **Tools** — `mem_init` / `mem_search` / `mem_read` / `mem_write` / `mem_delete` are registered in every agent's tool catalog.
+- **Always-on rules** — the complete workflow rules (below) are a system-prompt section in every session, equivalent to gitmemo's `agents-template.md`; the model cannot miss them.
+- **Session-start seed** — each new root session's system prompt automatically includes the most recent memory titles (configurable via `recentContextLimit`), so cross-session continuity is visible before any tool call. The lookup is read-only: it never creates `.mem`, and subagents are skipped.
+- **Skill** — the `gitmemo` skill remains loadable on demand as the complete reference (argument contract, entry format, search semantics).
+
+What stays with the model's judgment: keyword choice and whether to `mem_read` a hit — the same as the original gitmemo. What is NOT hookable: dsh has no reliable "conversation ended" event (`session/disposed` only fires when a session is deleted), so end-of-session writes are enforced by the always-on checkpoint rule, exactly like the original skill.
+
+## Agent Workflow (always-on rules)
 
 1. **Before work — search.** Extract 3-5 keywords from the request → `mem_search`. If more
    than 5 hits are relevant, read only the 5 most likely (`mem_read`). Paginate with `skip`

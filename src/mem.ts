@@ -11,7 +11,7 @@
  *
  * @module dsh-gitmemo/mem
  */
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdir, writeFile, rm, copyFile } from "node:fs/promises";
 import { dirname, basename, join, resolve, sep, isAbsolute } from "node:path";
 
@@ -79,6 +79,59 @@ function git(dir: string, args: string[], timeoutMs: number): Promise<string> {
       resolvePromise(stdout);
     });
   });
+}
+
+/** Synchronous git runner for the session-start injection path (must not race the first prompt assembly). */
+function gitSync(dir: string, args: string[], timeoutMs: number): string {
+  try {
+    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      throw new Error("gitmemo: git not found on PATH — gitmemo requires the git CLI");
+    }
+    const stderr = (error as { stderr?: Buffer }).stderr?.toString().trim();
+    throw new Error("gitmemo: git " + (args[0] ?? "") + " failed: " + (stderr || String(error)));
+  }
+}
+
+/** One commit record parsed from a git log batch. */
+interface ParsedRecord {
+  hash: string;
+  title: string;
+  date: string;
+  file: string;
+}
+
+/** Parse one `git log --format=%H\t%s\t%cd --name-only` batch into records. */
+function parseLogBatch(output: string): ParsedRecord[] {
+  const records: ParsedRecord[] = [];
+  let currentHash = "";
+  let currentSubject = "";
+  let currentDate = "";
+  let currentFile = "";
+  for (const rawLine of output.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    if (line.length === 0) continue;
+    const fields = line.split("\t");
+    if (COMMIT_RE.test(fields[0] ?? "")) {
+      if (currentHash.length > 0) {
+        records.push({ hash: currentHash, title: currentSubject, date: currentDate, file: currentFile });
+      }
+      currentHash = fields[0];
+      currentSubject = fields[1] ?? "";
+      currentDate = fields.slice(2).join(" ").trim();
+      currentFile = "";
+      continue;
+    }
+    if (currentFile.length === 0 && line.startsWith("entries/") && line.endsWith(".md")) {
+      currentFile = line;
+    }
+  }
+  if (currentHash.length > 0) {
+    records.push({ hash: currentHash, title: currentSubject, date: currentDate, file: currentFile });
+  }
+  return records;
 }
 
 /** True when a path points inside (or at) the memory entries directory. */
@@ -252,16 +305,34 @@ export class GitMemo {
     const grepArgs: string[] = [];
     for (const kw of keywords) grepArgs.push("--grep=" + kw);
     if (mode === "and") grepArgs.push("--all-match");
+    return this.scanLog(grepArgs, skip, limit);
+  }
 
-    // Files present at HEAD — delete commits and stale files are filtered out.
-    let activeEntries = "";
+  /**
+   * List the most recent memory entries across all branches, newest first.
+   * Used to seed a new session's system prompt with a compact overview.
+   * @param limit - maximum number of entries to return (0 returns none).
+   */
+  async recent(limit: number): Promise<SearchHit[]> {
+    if (!Number.isInteger(limit) || limit < 0) throw new Error("gitmemo: recent limit must be a non-negative integer");
+    if (limit === 0) return [];
+    // Read-only: never creates the .mem repo (session-start injection must not touch the workspace).
+    return this.scanLog([], 0, limit);
+  }
+
+  /** Active (non-deleted) entry files at HEAD. */
+  private async activeEntries(): Promise<Set<string>> {
     try {
-      activeEntries = await git(this.memDir, ["ls-tree", "-r", "--name-only", "HEAD", "--", "entries/"], this.config.gitTimeoutMs);
+      const output = await git(this.memDir, ["ls-tree", "-r", "--name-only", "HEAD", "--", "entries/"], this.config.gitTimeoutMs);
+      return new Set(output.split("\n").filter((line) => line.length > 0));
     } catch {
-      activeEntries = "";
+      return new Set();
     }
-    const active = new Set(activeEntries.split("\n").filter((line) => line.length > 0));
+  }
 
+  /** Shared git-log scan: keyword-grep optional, active-entry filtering, skip/limit. */
+  private async scanLog(grepArgs: string[], skip: number, limit: number): Promise<SearchHit[]> {
+    const active = await this.activeEntries();
     const results: SearchHit[] = [];
     let rawSkip = 0;
     let remainingSkip = skip;
@@ -288,49 +359,67 @@ export class GitMemo {
         return results; // no history yet (or log failure) — nothing to search
       }
       if (output.trim().length === 0) break;
-
-      let currentHash = "";
-      let currentSubject = "";
-      let currentDate = "";
-      let currentFile = "";
-      let records = 0;
-
-      for (const rawLine of output.split("\n")) {
-        const line = rawLine.replace(/\r$/, "");
-        if (line.length === 0) continue;
-        const fields = line.split("\t");
-        if (COMMIT_RE.test(fields[0] ?? "")) {
-          if (currentHash.length > 0) {
-            if (this.acceptRecord(currentHash, currentSubject, currentFile, active)) {
-              if (remainingSkip > 0) {
-                remainingSkip -= 1;
-              } else {
-                results.push({ hash: currentHash, title: currentSubject, date: currentDate });
-                if (results.length >= limit) break;
-              }
-            }
-          }
-          currentHash = fields[0];
-          currentSubject = fields[1] ?? "";
-          currentDate = fields.slice(2).join(" ").trim();
-          currentFile = "";
-          records += 1;
-          continue;
-        }
-        if (currentFile.length === 0 && line.startsWith("entries/") && line.endsWith(".md")) {
-          currentFile = line;
-        }
-      }
-      if (results.length >= limit) break;
-      if (currentHash.length > 0 && this.acceptRecord(currentHash, currentSubject, currentFile, active)) {
+      const records = parseLogBatch(output);
+      for (const record of records) {
+        if (!this.acceptRecord(record.hash, record.title, record.file, active)) continue;
         if (remainingSkip > 0) {
           remainingSkip -= 1;
         } else {
-          results.push({ hash: currentHash, title: currentSubject, date: currentDate });
+          results.push({ hash: record.hash, title: record.title, date: record.date });
+          if (results.length >= limit) break;
         }
       }
-      if (records < batchSize) break;
+      if (results.length >= limit) break;
+      if (records.length < batchSize) break;
       rawSkip += batchSize;
+    }
+    return results;
+  }
+
+  /**
+   * Synchronous variant of {@link recent} for the session-start injection
+   * path: blocks until the memory repo is scanned so the system-prompt
+   * context can be registered before the first request assembles.
+   */
+  recentSync(limit: number): SearchHit[] {
+    if (!Number.isInteger(limit) || limit < 0) throw new Error("gitmemo: recent limit must be a non-negative integer");
+    if (limit === 0) return [];
+    let active = new Set<string>();
+    try {
+      const output = gitSync(this.memDir, ["ls-tree", "-r", "--name-only", "HEAD", "--", "entries/"], this.config.gitTimeoutMs);
+      active = new Set(output.split("\n").filter((line) => line.length > 0));
+    } catch {
+      return []; // no memory repo yet
+    }
+    const results: SearchHit[] = [];
+    const batchSize = 200;
+    let records: ParsedRecord[] = [];
+    for (let rawSkip = 0, batch = 0; batch < this.config.maxSearchBatches && results.length < limit; rawSkip += batchSize, batch += 1) {
+      const args = [
+        "log",
+        "--skip=" + rawSkip,
+        "--max-count=" + batchSize,
+        "--format=%H\t%s\t%cd",
+        "--date=iso",
+        "--name-only",
+        "--all",
+        "--",
+        "entries/"
+      ];
+      let output: string;
+      try {
+        output = gitSync(this.memDir, args, this.config.gitTimeoutMs);
+      } catch {
+        return results;
+      }
+      if (output.trim().length === 0) break;
+      records = parseLogBatch(output);
+      for (const record of records) {
+        if (!this.acceptRecord(record.hash, record.title, record.file, active)) continue;
+        results.push({ hash: record.hash, title: record.title, date: record.date });
+        if (results.length >= limit) break;
+      }
+      if (results.length >= limit || records.length < batchSize) break;
     }
     return results;
   }

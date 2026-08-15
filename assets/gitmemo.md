@@ -1,6 +1,6 @@
 # GitMemo — AI Agent Long-Term Memory (dsh-gitmemo)
 
-This project uses the `gitmemo` skill: long-term memory stored in a local **`.mem`** Git repository next to the project root. Git is the only dependency, and no manual memory commands are ever needed.
+This deployment uses the gitmemo plugin: long-term memory stored in a local **`.mem`** Git repository next to the project root. Git is the only dependency, and no manual memory commands are ever needed. The workflow rules below are ALWAYS present in the system prompt; this skill is the complete reference for the tool argument contract and entry format.
 
 ## Tools
 
