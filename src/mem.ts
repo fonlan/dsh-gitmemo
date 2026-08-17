@@ -474,7 +474,7 @@ export class GitMemo {
     if (title === undefined || title.trim().length === 0) {
       throw new Error("gitmemo: write requires --title");
     }
-    if (body !== undefined && bodyFile !== undefined) throw new Error("gitmemo: use only one of body or bodyFile");
+    if (body !== undefined && bodyFile !== undefined) throw new Error("gitmemo: use only one of body or body_file — pass the commit body inline via body and omit body_file");
     if (content !== undefined && contentFile !== undefined) throw new Error("gitmemo: use only one of content or contentFile");
 
     // Resolve optional payload paths against the engine root when relative.

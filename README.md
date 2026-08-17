@@ -26,7 +26,7 @@ work. Git is the only dependency, and no manual memory commands are ever needed.
 | `mem_init` | Initialize the `.mem` repository (all other tools auto-initialize) |
 | `mem_search` | Search memories: `keywords` (comma-separated), `skip` (pagination), `mode` (`and` / `or` / `auto` — AND first, OR fallback). Returns up to 20 hits as `hash\|title\|date` |
 | `mem_read` | Read one memory entry by commit hash (full markdown) |
-| `mem_write` | Store a task outcome: `title` + `content` (or `content_file` / `file`), optional `body` / `body_file`. Commits `.mem/entries/<timestamp>-<slug>.md` and aligns the `.mem` branch |
+| `mem_write` | Store a task outcome: `title` + `content` (or `content_file` / `file`), optional inline `body` (commit body; engine API still supports `body_file`). Commits `.mem/entries/<timestamp>-<slug>.md` and aligns the `.mem` branch |
 | `mem_delete` | Delete a memory entry by commit hash (then redo and rewrite) |
 | Always-on rules section | The complete workflow rules (gitmemo's `agents-template.md` equivalent) are injected into **every** session's system prompt — no skill load needed |
 | Session-start injection | On every new **root** agent session, the N most recent memory titles (`hash\|title\|date`) are automatically injected into that session's system prompt, so prior-session context is visible before any tool call; subagents are skipped and the lookup never creates `.mem` |

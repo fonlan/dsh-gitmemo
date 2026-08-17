@@ -26,7 +26,7 @@ markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库，并在开�
 | `mem_init` | 初始化 `.mem` 仓库（其余工具都会自动初始化） |
 | `mem_search` | 搜索记忆：`keywords`（逗号分隔）、`skip`（分页）、`mode`（`and` / `or` / `auto`，auto 先 AND 后 OR 兜底）。每次最多返回 20 条 `hash\|title\|date` |
 | `mem_read` | 按提交哈希读取一条记忆的完整 markdown |
-| `mem_write` | 存储任务结论：`title` + `content`（或 `content_file` / `file`），可选 `body` / `body_file`。提交为 `.mem/entries/<时间戳>-<slug>.md` 并对齐 `.mem` 分支 |
+| `mem_write` | 存储任务结论：`title` + `content`（或 `content_file` / `file`），可选内联 `body`（commit body；引擎 API 仍支持 `body_file`）。提交为 `.mem/entries/<时间戳>-<slug>.md` 并对齐 `.mem` 分支 |
 | `mem_delete` | 按提交哈希删除记忆条目（然后重做并重写） |
 | 常驻规则片段 | 完整工作流规则（相当于 gitmemo 的 `agents-template.md`）注入**每个**会话的系统提示词——无需加载技能即可生效 |
 | 会话开始注入 | 每个新**根** Agent 会话开始时，自动把最近 N 条记忆标题（`hash\|title\|date`）注入该系统提示词，跨会话上下文在调用任何工具前即可见；子代理被跳过，且该查询只读、绝不创建 `.mem` |

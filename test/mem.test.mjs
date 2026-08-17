@@ -215,6 +215,16 @@ test("write via content_file (temp copied then deleted) and via file in place", 
   const bodyLog = git(join(root, ".mem"), ["log", "-1", "--format=%B", w6.hash]);
   assert.match(bodyLog, /summary line/);
   assert.match(bodyLog, /date: 2026-01-01T00:00:00Z/);
+
+  // commit body via body_file stays supported at the engine level
+  // (the model-facing schema no longer exposes body_file, but direct
+  // programmatic calls with only bodyFile must still succeed)
+  const bodyFile = join(root, "commit-body.txt");
+  writeFileSync(bodyFile, "body from file\n\ndate: 2026-01-02T00:00:00Z", "utf8");
+  const w7 = await memo.write({ title: "[core] body from file", content: "x", bodyFile });
+  const bodyLog2 = git(join(root, ".mem"), ["log", "-1", "--format=%B", w7.hash]);
+  assert.match(bodyLog2, /body from file/);
+  assert.match(bodyLog2, /date: 2026-01-02T00:00:00Z/);
 });
 
 test("validation errors", async () => {
@@ -222,7 +232,7 @@ test("validation errors", async () => {
   const memo = new GitMemo(root);
   await assert.rejects(() => memo.write({ title: "", content: "x" }), /requires --title/);
   await assert.rejects(() => memo.write({ title: "t", content: "x", contentFile: join(root, "f.md") }), /only one of content or contentFile/);
-  await assert.rejects(() => memo.write({ title: "t", body: "b", bodyFile: join(root, "b.txt") }), /only one of body or bodyFile/);
+  await assert.rejects(() => memo.write({ title: "t", body: "b", bodyFile: join(root, "b.txt") }), /only one of body or body_file/);
   await assert.rejects(() => memo.write({ title: "t" }), /missing content/);
   await assert.rejects(() => memo.write({ title: "t", content: "x", bodyFile: join(root, "missing-body.txt") }), /body file not found/);
   await assert.rejects(() => memo.write({ title: "t", contentFile: join(root, "missing.md") }), /not found/);
@@ -312,6 +322,25 @@ test("plugin module: exports, config schema, and tool registration on a stub ctx
   assert.ok(search.parameters.required.includes("keywords"));
   assert.deepEqual(search.parameters.properties.mode.enum, ["and", "or", "auto"]);
   assert.equal(search.parameters.properties.keywords.type, "string");
+
+  // mem_write exposes only inline `body` to the model — body_file was removed
+  // from the model-facing schema so the model cannot hit the engine's
+  // body-vs-body_file mutual-exclusion guard by passing both.
+  const write = registered.find((t) => t.name === "mem_write");
+  assert.ok(write.parameters.properties.body);
+  assert.ok(!Object.hasOwn(write.parameters.properties, "body_file"));
+
+  // ...but the plugin's execute path still forwards legacy body_file args to
+  // the engine, which rejects the conflict defensively without committing.
+  const toolRoot = mkdtempSync(join(tmpdir(), "gitmemo-tool-"));
+  dirs.push(toolRoot);
+  await assert.rejects(
+    () => write.execute(
+      { title: "[tool] guarded", body: "inline", body_file: join(toolRoot, "b.txt") },
+      { agent: { session: { header: { cwd: toolRoot } } } }
+    ),
+    /only one of body or body_file/
+  );
 
   // The always-on rules section carries the full workflow (agents-template equivalent)
   assert.equal(sections.length, 1);

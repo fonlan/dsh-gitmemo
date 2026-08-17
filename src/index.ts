@@ -212,11 +212,7 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
       },
       body: {
         type: "string",
-        description: "Optional commit body: 1-3 sentence summary + metadata. Not memory content."
-      },
-      body_file: {
-        type: "string",
-        description: "Path to a file holding the commit body (alternative to body)."
+        description: "Optional commit body: 1-3 sentence summary + metadata, passed inline. Not memory content."
       }
     },
     output: {
@@ -233,6 +229,9 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
     },
     isConcurrencySafe: () => false,
     async execute(
+      // body_file is not model-facing anymore (removed from parameters above);
+      // it is still accepted here so legacy logged calls / direct dispatches map
+      // without breaking, and the engine still guards body vs body_file.
       args: { title: string; content?: string; content_file?: string; file?: string; body?: string; body_file?: string },
       exec: unknown
     ) {
