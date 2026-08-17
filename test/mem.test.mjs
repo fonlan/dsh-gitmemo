@@ -342,6 +342,30 @@ test("plugin module: exports, config schema, and tool registration on a stub ctx
     /only one of body or body_file/
   );
 
+  // Optional path fields may arrive as blank placeholders from a model/tool adapter;
+  // the plugin must treat them as omitted while preserving the engine guard.
+  const toolExec = { agent: { session: { header: { cwd: toolRoot } } } };
+  const blank = await write.execute(
+    { title: "[tool] blank content file", content: "blank content", content_file: "" },
+    toolExec
+  );
+  assert.equal((await new GitMemo(toolRoot).read(blank.hash)).content, "blank content");
+  const whitespace = await write.execute(
+    { title: "[tool] whitespace content file", content: "whitespace content", content_file: "   " },
+    toolExec
+  );
+  assert.equal((await new GitMemo(toolRoot).read(whitespace.hash)).content, "whitespace content");
+
+  // A real content_file path still uses the file-backed path and is cleaned up.
+  const realContentFile = join(toolRoot, "adapter-entry.md");
+  writeFileSync(realContentFile, "real file content", "utf8");
+  const fromFile = await write.execute(
+    { title: "[tool] real content file", content_file: realContentFile },
+    toolExec
+  );
+  assert.equal((await new GitMemo(toolRoot).read(fromFile.hash)).content, "real file content");
+  assert.ok(!existsSync(realContentFile));
+
   // The always-on rules section carries the full workflow (agents-template equivalent)
   assert.equal(sections.length, 1);
   assert.equal(sections[0].name, "memory:gitmemo");

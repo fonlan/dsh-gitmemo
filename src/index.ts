@@ -77,6 +77,11 @@ function textBlock(text: string) {
   return [{ type: "text" as const, text }];
 }
 
+/** Treat blank optional adapter values as omitted without weakening engine validation. */
+function blankToUndefined(value: string | undefined): string | undefined {
+  return value !== undefined && value.trim().length === 0 ? undefined : value;
+}
+
 /** Register every model-facing tool. */
 function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, config: ResolvedConfig): void {
   void config;
@@ -239,10 +244,10 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
       return await memo.write({
         title: args.title,
         content: args.content,
-        contentFile: args.content_file,
-        file: args.file,
+        contentFile: blankToUndefined(args.content_file),
+        file: blankToUndefined(args.file),
         body: args.body,
-        bodyFile: args.body_file
+        bodyFile: blankToUndefined(args.body_file)
       });
     },
     presentCall: (args: { title: string }) => ({
