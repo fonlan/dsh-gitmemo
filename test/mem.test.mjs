@@ -233,6 +233,10 @@ test("validation errors", async () => {
   await assert.rejects(() => memo.write({ title: "", content: "x" }), /requires --title/);
   await assert.rejects(() => memo.write({ title: "t", content: "x", contentFile: join(root, "f.md") }), /only one of content or contentFile/);
   await assert.rejects(() => memo.write({ title: "t", body: "b", bodyFile: join(root, "b.txt") }), /only one of body or body_file/);
+  const blankContent = await memo.write({ title: "blank content file", content: "x", contentFile: "" });
+  assert.equal((await memo.read(blankContent.hash)).content, "x");
+  const whitespaceContent = await memo.write({ title: "whitespace content file", content: "y", contentFile: "   " });
+  assert.equal((await memo.read(whitespaceContent.hash)).content, "y");
   await assert.rejects(() => memo.write({ title: "t" }), /missing content/);
   await assert.rejects(() => memo.write({ title: "t", content: "x", bodyFile: join(root, "missing-body.txt") }), /body file not found/);
   await assert.rejects(() => memo.write({ title: "t", contentFile: join(root, "missing.md") }), /not found/);

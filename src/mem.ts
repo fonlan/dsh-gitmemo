@@ -172,6 +172,11 @@ function normalizeEntryFile(file: string, memDir: string, baseDir: string): stri
   return "entries/" + normalized;
 }
 
+/** Treat blank optional path arguments as omitted. */
+function blankToUndefined(value: string | undefined): string | undefined {
+  return value !== undefined && value.trim().length === 0 ? undefined : value;
+}
+
 /** Reject paths that could escape the memory repo. */
 function isSafeEntryPath(file: string): boolean {
   if (file.startsWith("/") || file.includes("../") || file.endsWith("/..") || file.includes("\\") || file.includes(":")) {
@@ -470,7 +475,11 @@ export class GitMemo {
    */
   async write(options: WriteOptions): Promise<WriteResult> {
     await ensureInit(this.memDir, this.config.gitTimeoutMs);
-    const { title, content, contentFile, file, body, bodyFile } = options;
+    const { title, content } = options;
+    const contentFile = blankToUndefined(options.contentFile);
+    const file = blankToUndefined(options.file);
+    const body = options.body;
+    const bodyFile = blankToUndefined(options.bodyFile);
     if (title === undefined || title.trim().length === 0) {
       throw new Error("gitmemo: write requires --title");
     }
