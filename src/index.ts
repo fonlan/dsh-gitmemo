@@ -2,20 +2,27 @@
  * dsh-gitmemo — Git-backed long-term memory for DeepSeek Harness.
  *
  * A Cordis plugin mirroring gitmemo (https://github.com/fonlan/gitmemo):
- * the agent stores completed task outcomes as markdown entries in a local
- * `.mem` git repository and searches them before starting new work.
+ * the root agent stores completed task outcomes as immutable markdown
+ * entries in a local `.mem` git repository (single `main` branch, structured
+ * commit messages) and searches them before starting new work.
  *
- * This plugin registers on the host plane:
- *  - five model-facing tools: `mem_init`, `mem_search`, `mem_read`,
- *    `mem_write`, `mem_delete` (backed by {@link GitMemo});
- *  - an always-on system-prompt section with the full memory workflow rules;
- *  - a per-session seed of the most recent memory titles.
+ * Mechanism:
+ *  - only ROOT agents (delegationDepth === 0) receive the gitmemo workflow
+ *    section and the five `mem_*` tools, scoped into `agent.ctx` at
+ *    `agent/created`; subagents carry neither (no token cost, no duplicate
+ *    memory writes);
+ *  - registration performs zero Git I/O;
+ *  - no session-start seeding, no synchronous git runners, no branch
+ *    alignment — `.mem` permanently stays on `main`;
+ *  - the previous `mem_init` tool is gone from the model surface; legacy
+ *    argument shapes are accepted for one version by the core engine
+ *    compatibility adapter, while the model-facing schemas stay strict.
  *
  * @module dsh-gitmemo
  */
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { GitMemo, type GitMemoConfig } from "./mem.js";
+import { GitMemo, GitMemoError, resolveProjectRoot, type GitMemoConfig, type SearchOutput } from "./mem.js";
 
 /** Cordis plugin name. */
 const name = "dsh-gitmemo";
@@ -23,25 +30,25 @@ const name = "dsh-gitmemo";
 /** Host services this plugin needs. */
 const inject = ["tools", "systemPrompt"];
 
-/** Plugin configuration (all optional). */
+/** Plugin configuration. */
 const Config = z.object({
-  /** Name of the memory repo directory at the project root. Default ".mem". */
+  /** @deprecated — the memory dir is fixed at `<projectRoot>/.mem`; kept for one version. */
   memDirName: z.string().default(".mem"),
-  /** Max search hits per mem_search call. Default 20. */
+  /** Max search hits per mem_search call (page size). Default 20. */
   searchLimit: z.number().default(20),
-  /** Align the .mem branch with the project branch on writes. Default true. */
+  /** @deprecated — `.mem` always stays on main; kept for one version, no effect. */
   branchAlign: z.boolean().default(true),
-  /** Number of most recent memory titles injected into each new session's system prompt (0 disables). Default 5. */
+  /** @deprecated — session-start recent seeding was removed; kept for one version, no effect. */
   recentContextLimit: z.number().default(5),
+  /** Cross-process lock wait timeout in milliseconds. Default 30000. */
+  lockTimeoutMs: z.number().default(30000),
   /** Optional explicit project root; defaults to the calling session's cwd. */
   projectRoot: z.string()
 });
 
 interface ResolvedConfig {
-  memDirName: string;
   searchLimit: number;
-  branchAlign: boolean;
-  recentContextLimit: number;
+  lockTimeoutMs: number;
   projectRoot?: string;
 }
 
@@ -50,14 +57,13 @@ function sessionCwd(exec: { agent?: { session?: { header?: { cwd?: string } } } 
   return exec.agent?.session?.header?.cwd;
 }
 
-/** Build the engine for one tool call. */
-function engineFor(exec: unknown, config: ResolvedConfig): GitMemo {
+/** Build the engine for one tool call (project root per plan 3.1). */
+async function engineFor(exec: unknown, config: ResolvedConfig): Promise<GitMemo> {
   const cwd = sessionCwd(exec as { agent?: { session?: { header?: { cwd?: string } } } }) ?? process.cwd();
-  const root = config.projectRoot ?? cwd;
+  const root = config.projectRoot ?? (await resolveProjectRoot(cwd));
   const engineConfig: GitMemoConfig = {
-    memDirName: config.memDirName,
     searchLimit: config.searchLimit,
-    branchAlign: config.branchAlign
+    lockTimeoutMs: config.lockTimeoutMs
   };
   return new GitMemo(root, engineConfig);
 }
@@ -67,9 +73,41 @@ const SEARCH_HIT = {
   additionalProperties: false,
   properties: {
     hash: { type: "string", required: true, description: "Full commit hash of the memory entry." },
-    title: { type: "string", required: true, description: "Commit subject (the entry title)." },
-    date: { type: "string", required: true, description: "Commit date in ISO format." }
+    title: { type: "string", required: true, description: "Entry title (commit subject)." },
+    date: { type: "string", required: true, description: "Commit date in ISO format." },
+    summary: { type: "string", required: true, description: "Entry summary (from the commit body)." },
+    keywords: {
+      type: "array",
+      required: true,
+      items: { type: "string" },
+      description: "Structured keywords stored with the entry."
+    },
+    score: { type: "number", required: true, description: "Number of distinct query keywords matched." },
+    matched_keywords: {
+      type: "array",
+      required: true,
+      items: { type: "string" },
+      description: "The query keywords that actually matched this entry."
+    }
   }
+} as const;
+
+const KEYWORDS_ARRAY = {
+  type: "array",
+  items: { type: "string" },
+  description: "1-12 keywords (include 中英文 synonyms when useful)."
+} as const;
+
+const RELATED_BRANCHES = {
+  type: "array",
+  items: { type: "string" },
+  description: "Related code branches (max 32; the current branch is always recorded)."
+} as const;
+
+const RELATED_PATHS = {
+  type: "array",
+  items: { type: "string" },
+  description: "Project-relative paths (max 128; absolute paths and escaping paths are rejected)."
 } as const;
 
 /** Render one tool output block as plain text. */
@@ -77,57 +115,46 @@ function textBlock(text: string) {
   return [{ type: "text" as const, text }];
 }
 
-/** Treat blank optional adapter values as omitted without weakening engine validation. */
-function blankToUndefined(value: string | undefined): string | undefined {
-  return value !== undefined && value.trim().length === 0 ? undefined : value;
+function formatSearchResults(value: SearchOutput): string {
+  const lines = [
+    `snapshot=${value.snapshot} total=${value.total} next_skip=${value.next_skip ?? "null"}` +
+      (value.legacy === true ? " legacy=true" : "")
+  ];
+  for (const hit of value.results) {
+    lines.push(
+      hit.hash +
+        "|" +
+        hit.title +
+        "|" +
+        hit.date +
+        "|score=" +
+        hit.score +
+        "|matched=" +
+        hit.matched_keywords.join(",")
+    );
+    if (hit.summary.length > 0) lines.push("  summary: " + hit.summary.replace(/\s+/g, " ").slice(0, 300));
+  }
+  if (value.results.length === 0) lines.push("(no matching memories)");
+  if (value.warning !== undefined) lines.push("warning: " + value.warning);
+  for (const diagnostic of value.diagnostics ?? []) lines.push("diagnostic: " + diagnostic);
+  return lines.join("\n");
 }
 
-/** Register every model-facing tool. */
+/** Register the five model-facing tools into a scoped agent context. */
 function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, config: ResolvedConfig): void {
-  void config;
-
-  ctx.tools.register(defineTool({
-    name: "mem_init",
-    description:
-      "Initialize the gitmemo long-term memory repository (.mem git repo) at the project root. All other mem_* tools auto-initialize, so this is only needed to check or force initialization.",
-    parameters: {},
-    output: {
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          path: { type: "string", required: true, description: "Absolute path of the memory repository." }
-        }
-      },
-      render: (_args: unknown, value: { path: string }) => textBlock("OK: Memory repo ready at " + value.path)
-    },
-    isConcurrencySafe: () => false,
-    async execute(_args: unknown, exec: unknown) {
-      const memo = engineFor(exec, config);
-      const path = await memo.init();
-      return { path };
-    },
-    presentCall: () => ({ card: "generic", title: "Init gitmemo memory", kind: "other" })
-  }));
-
   ctx.tools.register(defineTool({
     name: "mem_search",
     description:
-      "Search the gitmemo long-term memory (.mem git repo) for past task outcomes. Call BEFORE starting work: extract 3-5 keywords from the user request, search, and reuse prior conclusions when relevant. Returns up to 20 hits formatted as `hash|title|date`; when nothing relevant appears, paginate with `skip` 20, 40, ...",
+      "Search the gitmemo long-term memory (.mem git repo) for past task outcomes. Call BEFORE starting repo-related work: extract 1-12 中英文关键词 from the user request (include synonyms in both languages when useful) and run mem_search; pure chat and general Q&A need no search. Returns a snapshot, total, next_skip and up to 20 scored hits with summary/keywords/matched_keywords — select at most 5 most relevant hits and mem_read them. Paginate by passing skip and the returned snapshot back unchanged; a stale snapshot is rejected explicitly.",
     parameters: {
-      keywords: {
-        type: "string",
-        required: true,
-        description: "Comma-separated keywords (3-5 recommended), e.g. \"auth,rate-limit,login\"."
-      },
+      keywords: { ...KEYWORDS_ARRAY, required: true },
       skip: {
         type: "integer",
         description: "Pagination offset (default 0)."
       },
-      mode: {
+      snapshot: {
         type: "string",
-        enum: ["and", "or", "auto"],
-        description: "and=strict (all keywords), or=broad (any keyword), auto=AND first then OR fallback (default auto)."
+        description: "Snapshot returned by the first page — pass it back unchanged for stable pagination."
       }
     },
     output: {
@@ -135,23 +162,37 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
         type: "object",
         additionalProperties: false,
         properties: {
-          mode: { type: "string", required: true, description: "The mode actually used (and or or)." },
-          results: { type: "array", required: true, items: SEARCH_HIT }
+          snapshot: { type: "string", required: true, description: "Stable search snapshot; reuse for pagination." },
+          total: { type: "number", required: true, description: "Total matching results in the snapshot." },
+          next_skip: {
+            oneOf: [{ type: "number" }, { type: "null" }],
+            required: true,
+            description: "Offset for the next page, or null."
+          },
+          results: { type: "array", required: true, items: SEARCH_HIT },
+          legacy: { type: "boolean", description: "True when searching a legacy (pre-migration) repo read-only." },
+          warning: { type: "string", description: "Compatibility/deprecation warning, when present." },
+          diagnostics: {
+            type: "array",
+            items: { type: "string" },
+            description: "Malformed commit/file mappings skipped during search."
+          }
         }
       },
-      render: (_args: unknown, value: { mode: string; results: Array<{ hash: string; title: string; date: string }> }) => {
-        const lines = value.results.map((hit) => hit.hash + "|" + hit.title + "|" + hit.date);
-        return textBlock(lines.length > 0 ? lines.join("\n") : "(no matching memories)");
-      }
+      render: (_args: unknown, value: SearchOutput) => textBlock(formatSearchResults(value))
     },
     isConcurrencySafe: () => true,
-    async execute(args: { keywords: string; skip?: number; mode?: string }, exec: unknown) {
-      const memo = engineFor(exec, config);
-      return await memo.search(args.keywords, args.skip ?? 0, (args.mode as "and" | "or" | "auto") ?? "auto");
+    async execute(args: { keywords: string[] | string; skip?: number; snapshot?: string; mode?: string }, exec: unknown) {
+      const memo = await engineFor(exec, config);
+      return await memo.search(args.keywords, {
+        skip: args.skip ?? 0,
+        snapshot: args.snapshot,
+        mode: (args.mode as "and" | "or" | "auto" | undefined)
+      });
     },
-    presentCall: (args: { keywords: string }) => ({
+    presentCall: (args: { keywords: string[] | string }) => ({
       card: "generic",
-      title: "Search memory: " + args.keywords,
+      title: "Search memory: " + (Array.isArray(args.keywords) ? args.keywords.join(", ") : args.keywords),
       kind: "other"
     })
   }));
@@ -159,12 +200,12 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
   ctx.tools.register(defineTool({
     name: "mem_read",
     description:
-      "Read one gitmemo memory entry by commit hash (returned by mem_search). Select only the most relevant memories before reading — at most 5 when a search returns more.",
+      "Read one gitmemo memory entry by commit hash (returned by mem_search). Select only the most relevant memories before reading — at most 5 when a search returns more. Historical entries that were replaced or deleted stay readable for audit.",
     parameters: {
       commit_hash: {
         type: "string",
         required: true,
-        description: "Commit hash of the memory entry to read."
+        description: "Commit hash of the memory entry to read (create or replace hash)."
       }
     },
     output: {
@@ -174,17 +215,18 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
         properties: {
           commit_hash: { type: "string", required: true },
           file: { type: "string", required: true, description: "Entry file path inside the memory repo." },
-          content: { type: "string", required: true, description: "Full markdown of the memory entry." }
+          content: { type: "string", required: true, description: "Full markdown of the memory entry." },
+          legacy: { type: "boolean", description: "True for legacy-format commits (pre-migration)." }
         }
       },
-      render: (_args: unknown, value: { commit_hash: string; file: string; content: string }) =>
-        textBlock(value.content)
+      render: (_args: unknown, value: { commit_hash: string; file: string; content: string; legacy?: boolean }) =>
+        textBlock((value.legacy === true ? "[legacy entry]\n" : "") + value.content)
     },
     isConcurrencySafe: () => true,
     async execute(args: { commit_hash: string }, exec: unknown) {
-      const memo = engineFor(exec, config);
-      const { file, content } = await memo.read(args.commit_hash);
-      return { commit_hash: args.commit_hash, file, content };
+      const memo = await engineFor(exec, config);
+      const { hash, file, content, legacy } = await memo.read(args.commit_hash);
+      return { commit_hash: hash, file, content, ...(legacy ? { legacy: true } : {}) };
     },
     presentCall: (args: { commit_hash: string }) => ({
       card: "generic",
@@ -196,29 +238,30 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
   ctx.tools.register(defineTool({
     name: "mem_write",
     description:
-      "Store a completed task outcome in the gitmemo long-term memory (.mem git repo). Write ONLY when the task is complete AND repo-related AND the outcome is valuable/reusable OR the user explicitly asked to remember. Entry markdown goes through `content` (or `content_file`); `title` is a short \"[module] action + object\"; `body` is an optional 1-3 sentence commit body (never memory content). The entry is committed as `.mem/entries/<timestamp>-<slug>.md` and the .mem branch follows the project branch.",
+      "Store a completed task outcome in the gitmemo long-term memory (.mem git repo). Write ONLY when the task is complete AND repo-related AND the outcome is valuable/reusable OR the user explicitly asked to remember. Entries are immutable: title (single line, ≤200 chars, \"[module] action + object\"), summary (≤4000 chars), keywords (2-12, include 中英文同义词) and content (markdown body; the engine generates front matter) are all required; related_branches/related_paths are optional. Corrections use mem_replace, withdrawal uses mem_delete — never rewrite in place.",
     parameters: {
       title: {
         type: "string",
         required: true,
-        description: "Short \"[module] action + object\" title, e.g. \"[auth] add rate-limit for login\"."
+        description: "Short \"[module] action + object\" title, single line, e.g. \"[auth] add rate-limit for login\"."
+      },
+      summary: {
+        type: "string",
+        required: true,
+        description: "1-3 sentence summary of the outcome (multi-line allowed, ≤4000 chars)."
+      },
+      keywords: {
+        ...KEYWORDS_ARRAY,
+        required: true,
+        description: "2-12 keywords (1-64 chars each); include 中英文同义词, e.g. [\"auth\", \"rate-limit\", \"登录\", \"限流\"]."
       },
       content: {
         type: "string",
-        description: "The memory entry markdown (YAML front matter + sections). Provide exactly one of content / content_file / file."
+        required: true,
+        description: "The memory markdown body (engine generates front matter and standard sections)."
       },
-      content_file: {
-        type: "string",
-        description: "Path to a file holding the entry markdown (alternative to content; temp files are deleted after a successful write)."
-      },
-      file: {
-        type: "string",
-        description: "An existing .mem/entries/... path to commit in place (alternative to content / content_file)."
-      },
-      body: {
-        type: "string",
-        description: "Optional commit body: 1-3 sentence summary + metadata, passed inline. Not memory content."
-      }
+      related_branches: RELATED_BRANCHES,
+      related_paths: RELATED_PATHS
     },
     output: {
       schema: {
@@ -226,28 +269,41 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
         additionalProperties: false,
         properties: {
           hash: { type: "string", required: true, description: "Commit hash of the new memory entry." },
-          file: { type: "string", required: true, description: "Entry file path inside the memory repo." }
+          file: { type: "string", required: true, description: "Entry file path inside the memory repo." },
+          legacy: { type: "boolean", description: "True when written through the legacy compatibility adapter." }
         }
       },
-      render: (_args: unknown, value: { hash: string; file: string }) =>
-        textBlock("OK: " + value.hash + "|" + value.file)
+      render: (_args: unknown, value: { hash: string; file: string; legacy?: boolean }) =>
+        textBlock("OK: " + value.hash + "|" + value.file + (value.legacy === true ? " (legacy adapter)" : ""))
     },
     isConcurrencySafe: () => false,
     async execute(
-      // body_file is not model-facing anymore (removed from parameters above);
-      // it is still accepted here so legacy logged calls / direct dispatches map
-      // without breaking, and the engine still guards body vs body_file.
-      args: { title: string; content?: string; content_file?: string; file?: string; body?: string; body_file?: string },
+      args: {
+        title: string;
+        summary?: string;
+        keywords?: string[];
+        content?: string;
+        related_branches?: string[];
+        related_paths?: string[];
+        // Old in-place field may arrive from a bypassed/older caller and is
+        // rejected explicitly; other legacy shapes live at engine level.
+        file?: string;
+      },
       exec: unknown
     ) {
-      const memo = engineFor(exec, config);
+      const memo = await engineFor(exec, config);
+      if (args.file !== undefined) {
+        throw new GitMemoError(
+          "gitmemo: mem_write `file` (in-place commit) is not supported by the immutable entry model — pass content directly, or use mem_replace to update an entry"
+        );
+      }
       return await memo.write({
         title: args.title,
-        content: args.content,
-        contentFile: blankToUndefined(args.content_file),
-        file: blankToUndefined(args.file),
-        body: args.body,
-        bodyFile: blankToUndefined(args.body_file)
+        summary: args.summary ?? "",
+        keywords: args.keywords ?? [],
+        content: args.content ?? "",
+        related_branches: args.related_branches,
+        related_paths: args.related_paths
       });
     },
     presentCall: (args: { title: string }) => ({
@@ -260,12 +316,17 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
   ctx.tools.register(defineTool({
     name: "mem_delete",
     description:
-      "Delete a gitmemo memory entry by commit hash. Use when the user is unsatisfied with a stored outcome: delete, redo the task from feedback, then mem_write a corrected entry.",
+      "Withdraw a gitmemo memory entry whose conclusion is obsolete and has NO replacement. Requires the active commit hash (returned by mem_search) and a required reason. Use mem_replace when a new conclusion replaces the old one.",
     parameters: {
       commit_hash: {
         type: "string",
         required: true,
-        description: "Commit hash of the memory entry to delete."
+        description: "Active commit hash of the memory entry to withdraw."
+      },
+      reason: {
+        type: "string",
+        required: true,
+        description: "Why the conclusion is withdrawn (recorded in the delete commit)."
       }
     },
     output: {
@@ -279,9 +340,9 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
       render: (_args: unknown, value: { file: string }) => textBlock("OK: deleted " + value.file)
     },
     isConcurrencySafe: () => false,
-    async execute(args: { commit_hash: string }, exec: unknown) {
-      const memo = engineFor(exec, config);
-      const file = await memo.delete(args.commit_hash);
+    async execute(args: { commit_hash: string; reason: string }, exec: unknown) {
+      const memo = await engineFor(exec, config);
+      const { file } = await memo.delete({ commit_hash: args.commit_hash, reason: args.reason });
       return { file };
     },
     presentCall: (args: { commit_hash: string }) => ({
@@ -290,23 +351,98 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
       kind: "other"
     })
   }));
+
+  ctx.tools.register(defineTool({
+    name: "mem_replace",
+    description:
+      "Replace an active gitmemo memory entry with a new conclusion in ONE atomic commit (deletes the old entry file, adds the new one). Use when the user corrects a stored outcome — never delete-then-write. commit_hash must be the ACTIVE hash returned by mem_search; stale hashes are rejected. Takes the same fields as mem_write.",
+    parameters: {
+      commit_hash: {
+        type: "string",
+        required: true,
+        description: "Active commit hash of the entry to replace."
+      },
+      title: {
+        type: "string",
+        required: true,
+        description: "Short \"[module] action + object\" title, single line."
+      },
+      summary: {
+        type: "string",
+        required: true,
+        description: "1-3 sentence summary of the new conclusion."
+      },
+      keywords: {
+        ...KEYWORDS_ARRAY,
+        required: true,
+        description: "2-12 keywords (1-64 chars each); include 中英文同义词."
+      },
+      content: {
+        type: "string",
+        required: true,
+        description: "The new memory markdown body."
+      },
+      related_branches: RELATED_BRANCHES,
+      related_paths: RELATED_PATHS
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hash: { type: "string", required: true, description: "Commit hash of the replace commit." },
+          file: { type: "string", required: true, description: "New entry file path inside the memory repo." }
+        }
+      },
+      render: (_args: unknown, value: { hash: string; file: string }) =>
+        textBlock("OK: " + value.hash + "|" + value.file)
+    },
+    isConcurrencySafe: () => false,
+    async execute(
+      args: {
+        commit_hash: string;
+        title: string;
+        summary?: string;
+        keywords?: string[];
+        content?: string;
+        related_branches?: string[];
+        related_paths?: string[];
+      },
+      exec: unknown
+    ) {
+      const memo = await engineFor(exec, config);
+      return await memo.replace({
+        commit_hash: args.commit_hash,
+        title: args.title,
+        summary: args.summary ?? "",
+        keywords: args.keywords ?? [],
+        content: args.content ?? "",
+        related_branches: args.related_branches,
+        related_paths: args.related_paths
+      });
+    },
+    presentCall: (args: { commit_hash: string; title: string }) => ({
+      card: "generic",
+      title: "Replace memory " + args.commit_hash.slice(0, 8) + ": " + args.title,
+      kind: "other"
+    })
+  }));
 }
 
 /**
- * Register the always-on memory workflow rules (the equivalent of gitmemo's
- * agents-template.md). This section is part of every session's system prompt,
- * so the rules cannot be missed; the mem_* tool descriptions carry the
- * argument contract for each operation.
+ * Register the gitmemo workflow rules (plan 9.2) into a scoped agent context.
  */
 function registerPromptSection(ctx: { systemPrompt: { section(section: { name: string; order: number; text: string }): unknown } }): void {
   ctx.systemPrompt.section({
     name: "memory:gitmemo",
     order: 150,
     text: [
-      "This deployment provides gitmemo long-term memory: a local .mem git repository at the project root stores past task outcomes as markdown entries; git is the only dependency. Use the dedicated tools only (mem_search / mem_read / mem_write / mem_delete — all auto-initialize); never shell out to git or read .mem files directly.",
-      "- BEFORE WORK — search: extract 3-5 keywords from the user request and run mem_search. If more than 5 relevant hits appear, select only the 5 most likely (keyword overlap, title specificity, recency) and mem_read only those; reuse their conclusions when appropriate. If nothing relevant, paginate with skip 20, 40, ...",
-      "- USER UNSATISFIED — delete and rewrite: mem_delete the entry's commit hash, redo the task from the feedback, then mem_write a corrected entry.",
-      "- END-OF-SESSION CHECKPOINT — the ONLY write path: when the conversation is ending, review the whole session and mem_write EVERY completed repo-related task that still lacks a memory and whose outcome is valuable and reusable OR was explicitly asked to be remembered. Never write for pure Q&A, incomplete tasks, non-repo work, or purely operational git actions (commit/push only). Never duplicate an already-written entry; if a stored outcome is outdated, mem_delete it first, then write the corrected entry. Entry title: \"[module] action + object\"; content: markdown with YAML front matter (date, status, repo_branch, mem_branch, related_paths, tags) and Original User Request / AI Understanding / Final Outcome sections."
+      "This deployment provides gitmemo long-term memory: a local .mem git repository at the project root stores past task outcomes as immutable markdown entries; git is the only dependency. Use the dedicated tools only (mem_search / mem_read / mem_write / mem_delete / mem_replace — all auto-initialize); never shell out to git or read .mem files directly.",
+      "- BEFORE WORK — search: 仓库相关任务开始前提取 1–12 个中英文关键词调用 mem_search（含中英文同义词）；纯闲聊和通用问答无需搜索。",
+      "- RESULT PRESELECT — 根据 title、summary、keywords、score 和 matched keywords 选择最多 5 条执行 mem_read，复用相关结论；无相关结果时用返回的 snapshot + skip 翻页。",
+      "- END-OF-SESSION CHECKPOINT — the ONLY write path: 会话结束时回顾全程，仅当结论有价值、可复用或用户明确要求记住时 mem_write；纯问答、未完成任务、非仓库工作、纯操作类 git 动作（仅 commit/push）不写；避免语义重复。",
+      "- USER CORRECTION — 用户更正已有结论：有替代结论时调用 mem_replace（不得先 delete 再 write）；结论作废且无替代时调用带 reason 的 mem_delete。",
+      "- SUBAGENT RESULTS — 子代理结果由根 Agent 汇总后决定是否形成一条会话级记忆。"
     ].join("\n")
   });
 }
@@ -316,66 +452,52 @@ interface CreatedAgent {
   id: string;
   session?: { header?: { cwd?: string; delegationDepth?: number } };
   ctx: {
-    systemPrompt: { context(section: { name: string; order: number; text: string }): unknown };
+    tools: { register(tool: unknown): unknown };
+    systemPrompt: { section(section: { name: string; order: number; text: string }): unknown };
   };
 }
 
 /**
- * Seed every new ROOT agent session with the most recent memory titles.
- * Registered into the agent's own scope, so the block joins only that
- * session's prompt; subagents (delegationDepth > 0) are skipped, the lookup
- * is read-only (no .mem auto-init), and failures degrade to a log warning.
+ * Register the plugin: root-agent-scoped mem tools + workflow rules. No
+ * global tool registration, no session-start seeding, no Git I/O at
+ * registration time.
  */
-function registerRecentContext(
-  ctx: { on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown; logger: { warn(message: string): void } },
-  config: ResolvedConfig
-): void {
-  if (config.recentContextLimit <= 0) return;
-  ctx.on("agent/created", ({ agent }) => {
-    const header = agent.session?.header;
-    if (header?.cwd === undefined || (header.delegationDepth ?? 0) > 0) return;
-    try {
-      // Synchronous scan: registers the context before the first request assembles.
-      const memo = new GitMemo(config.projectRoot ?? header.cwd, {
-        memDirName: config.memDirName,
-        searchLimit: config.searchLimit,
-        branchAlign: config.branchAlign
-      });
-      const hits = memo.recentSync(config.recentContextLimit);
-      if (hits.length === 0) return;
-      const lines = hits.map((hit) => hit.hash + "|" + hit.title + "|" + hit.date);
-      agent.ctx.systemPrompt.context({
-        name: "memory:gitmemo-recent",
-        order: 400,
-        text: "Recent gitmemo memories from previous sessions (mem_read <hash> for details, mem_search for targeted lookups):\n" + lines.join("\n")
-      });
-    } catch (error) {
-      ctx.logger.warn(`dsh-gitmemo: recent-memory injection skipped for agent "${agent.id}": ${String(error)}`);
-    }
-  });
-}
-
-/**
- * Register the plugin: tools, always-on rules, and session-start seed.
- * @param ctx - registrant context carrying the host tool/prompt services.
- * @param config - plugin configuration (defaults applied by the loader).
- */
-async function apply(ctx: {
-  tools: { register(tool: unknown): unknown };
-  systemPrompt: { section(section: { name: string; order: number; text: string }): unknown };
-  on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown;
-  logger: { warn(message: string): void };
-}, config: Partial<ResolvedConfig> = {}): Promise<void> {
+async function apply(
+  ctx: {
+    on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown;
+    logger: { warn(message: string): void };
+  },
+  config: Partial<{
+    memDirName?: string;
+    searchLimit?: number;
+    branchAlign?: boolean;
+    recentContextLimit?: number;
+    lockTimeoutMs?: number;
+    projectRoot?: string;
+  }> = {}
+): Promise<void> {
   const resolved: ResolvedConfig = {
-    memDirName: config.memDirName ?? ".mem",
     searchLimit: config.searchLimit ?? 20,
-    branchAlign: config.branchAlign ?? true,
-    recentContextLimit: config.recentContextLimit ?? 5,
+    lockTimeoutMs: config.lockTimeoutMs ?? 30000,
     projectRoot: config.projectRoot
   };
-  registerMemTools(ctx, resolved);
-  registerPromptSection(ctx);
-  registerRecentContext(ctx, resolved);
+  if (config.branchAlign !== undefined && config.branchAlign !== true) {
+    ctx.logger.warn("dsh-gitmemo: `branchAlign` is deprecated and has no effect — .mem always stays on main");
+  }
+  if (config.recentContextLimit !== undefined && config.recentContextLimit !== 5) {
+    ctx.logger.warn("dsh-gitmemo: `recentContextLimit` is deprecated and has no effect — session-start recent seeding was removed");
+  }
+  if (config.memDirName !== undefined && config.memDirName !== ".mem") {
+    ctx.logger.warn(
+      "dsh-gitmemo: `memDirName` is deprecated — the memory directory is fixed at <projectRoot>/.mem; pass a legacy dir as the migration --source"
+    );
+  }
+  ctx.on("agent/created", ({ agent }) => {
+    const header = agent.session?.header;
+    if ((header?.delegationDepth ?? 0) > 0) return; // subagents: no gitmemo workflow or tools
+    registerMemTools(agent.ctx, resolved);
+    registerPromptSection(agent.ctx);
+  });
 }
 
 export { Config, apply, inject, name };

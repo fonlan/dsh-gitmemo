@@ -3,33 +3,33 @@
 [**English**](README.md) | **简体中文**
 
 **基于 Git 的 DeepSeek Harness (dsh) 长期记忆插件** —— 一个镜像
-[GitMemo](https://github.com/fonlan/gitmemo) 功能的 Cordis 插件。Agent 会把已完成任务的结论以
-markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库，并在开始新任务前先搜索既往记忆。唯一依赖
-是 Git，日常使用完全无需手动记忆命令。
+[GitMemo](https://github.com/fonlan/gitmemo) 功能的 Cordis 插件。根 Agent 会把已完成任务的结论以
+**不可变** markdown 条目存入项目根目录的本地 **`.mem`** Git 仓库（单一 `main` 分支 + 结构化提交信息），
+并在开始新任务前先搜索既往记忆。唯一依赖是 Git，日常使用完全无需手动记忆命令。
 
 ## 核心特性
 
 - **极其简单** —— 安装后日常任务无需任何手动记忆命令
-- **全自动** —— Agent 在正常任务流程中自动执行 `init` / `search` / `read` / `write` / `delete`
+- **全自动** —— 根 Agent 在正常任务流程中自动执行 `search` / `read` / `write` / `delete` / `replace`
 - **纯本地、可离线** —— 记忆存于本地 `.mem` Git 仓库，无云端依赖
 - **仅依赖 Git** —— 除 `git` CLI 外无任何运行时依赖
-- **省 token** —— 通过 `mem_search` 复用既有结论，而非反复注入上下文
-- **防止上下文膨胀** —— 先搜索后工作的流程，技能规定最多只读 5 条最相关记忆
-- **可审计** —— 每次记忆操作都是 `.mem` Git 历史中的一次提交
-- **可追溯** —— 每条记忆都能从提交历史中回溯与重放
-- **分支对齐** —— 写入时 `.mem` 分支跟随项目当前分支
+- **省 token** —— 通过 `mem_search` 复用既有结论；子代理既不携带工作流规则也不携带工具 schema
+- **条目不可变** —— 每次写入都创建新文件；更正用 `mem_replace`（一个提交同时删除旧文件、新增新文件），作废用 `mem_delete`
+- **结构化搜索** —— commit message 携带 `GitMemo-*` trailers（keywords、digest、search-text 投影）；搜索只对 commit message 执行 `git log --grep --fixed-strings`，绝不扫描条目正文
+- **可审计** —— 每次记忆操作都是 `.mem` Git 历史中的一次提交；被替换/删除的条目仍可按哈希读取
+- **崩溃安全** —— write/delete/replace 在修改条目前先写事务 journal；迁移另用 sibling swap journal，目录交换中断后会在自动初始化前恢复
+- **单分支** —— `.mem` 永远停留在 `main`；代码分支/SHA 只作为条目元数据记录
 
 ## 插件提供的内容
 
 | 内容 | 说明 |
 | --- | --- |
-| `mem_init` | 初始化 `.mem` 仓库（其余工具都会自动初始化） |
-| `mem_search` | 搜索记忆：`keywords`（逗号分隔）、`skip`（分页）、`mode`（`and` / `or` / `auto`，auto 先 AND 后 OR 兜底）。每次最多返回 20 条 `hash\|title\|date` |
-| `mem_read` | 按提交哈希读取一条记忆的完整 markdown |
-| `mem_write` | 存储任务结论：`title` + `content`（或 `content_file` / `file`），可选内联 `body`（commit body；引擎 API 仍支持 `body_file`）。提交为 `.mem/entries/<时间戳>-<slug>.md` 并对齐 `.mem` 分支 |
-| `mem_delete` | 按提交哈希删除记忆条目（然后重做并重写） |
-| 常驻规则片段 | 完整工作流规则（相当于 gitmemo 的 `agents-template.md`）注入**每个**会话的系统提示词——无需加载技能即可生效 |
-| 会话开始注入 | 每个新**根** Agent 会话开始时，自动把最近 N 条记忆标题（`hash\|title\|date`）注入该系统提示词，跨会话上下文在调用任何工具前即可见；子代理被跳过，且该查询只读、绝不创建 `.mem` |
+| `mem_search` | 搜索记忆：`keywords`（1–12 个关键词数组，建议中英文同义词）、`skip` + `snapshot`（稳定分页）。每次最多返回 20 条带 `summary` / `keywords` / `matched_keywords` 的评分结果 |
+| `mem_read` | 按创建/替换提交哈希读取一条记忆的完整 markdown（历史哈希仍可读） |
+| `mem_write` | 存储任务结论：`title` + `summary` + `keywords`（2–12）+ `content`（front matter 由引擎生成），可选 `related_branches` / `related_paths`。每个不可变文件对应一个 ADD 提交 |
+| `mem_delete` | 作废无替代结论（需要 `commit_hash` + `reason`） |
+| `mem_replace` | 一个原子提交内更正旧结论（D 旧文件 + A 新文件）—— 禁止先删后写 |
+| 作用域规则 | 工作流规则与五个工具只在 `agent/created` 时注册进**根 Agent**（`delegationDepth === 0`）；子代理两者皆无 |
 
 ## 安装
 
@@ -47,8 +47,8 @@ dsh plugin --profile web add @fonlan/dsh-gitmemo
 dsh plugin --profile web add /path/to/dsh-gitmemo
 ```
 
-然后重启对应的 dsh profile（例如重启 `dsh web` 进程）。插件注册在宿主平面，该 profile 下所有
-Agent 会话都能看到这些工具与技能。
+然后重启对应的 dsh profile（例如重启 `dsh web` 进程）。插件注册在宿主平面，该 profile 下每个新
+**根** Agent 会话都能看到这些工具与规则。
 
 ### 配置
 
@@ -57,75 +57,69 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
 ```yaml
 - id: dsh-gitmemo
   config:
-    memDirName: .mem       # 项目根目录下记忆仓库的目录名
-    searchLimit: 20        # 每次 mem_search 返回的最大条数
-    branchAlign: true      # 写入时 .mem 分支跟随项目分支
-    recentContextLimit: 5  # 注入每个新会话系统提示词的最近记忆条数（0 表示关闭）
+    searchLimit: 20        # 每次 mem_search 返回的最大条数（每页大小）
+    lockTimeoutMs: 30000   # 跨进程锁等待超时
     projectRoot: null      # 可选：显式项目根目录（默认取会话工作目录）
 ```
 
-## 记忆存放位置
+## 记忆存放位置与格式
 
 `.mem` 仓库位于调用会话工作区的**项目根目录**（`git rev-parse --show-toplevel`，找不到时退回
-工作目录）。条目是 `.mem/entries/` 下的 markdown 文件；每次操作都是一次提交，整个记忆可以用
-普通 `git` 命令查看：
+工作目录；显式配置 `projectRoot` 优先）。仓库结构：
+
+```text
+.mem/
+├── .git/
+├── .gitmemo-format        # schema 版本标记，如 "2"
+└── entries/               # 每个活跃记忆一个不可变文件
+    └── <utc-ms>-<digest-prefix>-<slug>.md
+```
+
+- `.mem` 初始化在自己的 `main` 分支上；初始化时把 `.mem/` 与锁文件路径写入父仓库的
+  `.git/info/exclude`（绝不写入受版本控制的 `.gitignore`），且当父仓库已跟踪 `.mem` 内容时拒绝初始化。
+- 每次写入都用独占创建生成全新文件（绝不覆盖），以带结构化 trailers 的 ADD 提交落库，并把代码
+  分支/SHA/相关路径记录在条目 front matter 中。
+
+整个记忆可以用普通 `git` 命令查看：
 
 ```bash
 git -C .mem log --oneline
 git -C .mem show <commit-hash>
 ```
 
-> 提示：建议把 `.mem/` 加入项目的 `.gitignore`，避免记忆仓库混入项目提交。
+## Agent 工作流（常驻规则，仅根 Agent）
 
-## Agent 工作流（常驻规则）
-
-1. **开工前 —— 搜索。** 从请求中提取 3-5 个关键词 → `mem_search`。若相关结果超过 5 条，只
-   `mem_read` 最可能相关的 5 条。无相关结果时用 `skip` 20、40… 翻页。
-2. **用户不满意 —— 删除重写。** `mem_delete <hash>` → 按反馈重做 → `mem_write` 更正后的条目。
-3. **会话结束检查点 —— 唯一的写入路径。** 对话即将结束时，回顾整个会话，用 `mem_write` 写入
-   **每一条**已完成、与仓库相关、且结论**有价值/可复用**（或用户明确要求记住）但还没有记忆的任务。
-   绝不重复写已存在的条目；若已存结论已过时，先 `mem_delete` 再写更正条目。纯问答、未完成任务、
-   与仓库无关的工作、纯操作性的 git 动作一律不写。关闭会话前写完所有待写记忆。
-
-## 条目格式
-
-```markdown
----
-date: 2026-02-19T15:10:10Z
-status: done
-repo_branch: main
-repo_commit: 9f3e1a2
-mem_branch: main
-related_paths: [src/auth/login.ts]
-tags: [auth, security]
----
-### Original User Request
-(verbatim)
-### AI Understanding
-- Goal: / Constraints: / Out of scope:
-### Final Outcome
-- Changes/outputs summary
-```
+1. **开工前 —— 搜索。** 仓库相关任务开始前提取 1–12 个中英文关键词 → `mem_search`。纯闲聊和通用问答无需搜索。
+2. **结果预筛。** 根据 `title` / `summary` / `keywords` / `score` / `matched_keywords` 最多
+   `mem_read` 5 条最相关记忆；用 `skip` + 返回的 `snapshot` 翻页。
+3. **会话结束检查点 —— 唯一的写入路径。** 对话即将结束时，`mem_write` **每一条**已完成、与仓库
+   相关、且结论**有价值/可复用**（或用户明确要求记住）但还没有记忆的任务。绝不重复写已存在的条目。
+   纯问答、未完成任务、与仓库无关的工作、纯操作性的 git 动作一律不写。
+4. **用户更正。** 已存结论过时且有替代结论 → `mem_replace`（禁止先 delete 再 write）；结论作废且无
+   替代 → 带 `reason` 的 `mem_delete`。
+5. **子代理结果。** 是否形成一条会话级记忆，由根 Agent 汇总后决定。
 
 ## 开发
 
 ```bash
 npm install
 npm run build    # tsc → lib/
-npm test         # 构建 + 引擎/插件单元测试（node:test）
+npm test         # 构建 + 引擎/插件/迁移单元测试（node:test）
 ```
 
 ## 目录结构
 
 ```
 dsh-gitmemo/
-├── package.json          # npm 包；dsh.bundle.patch 接入 profile 层
+├── package.json          # npm 包；dsh.bundle.patch 接入 profile 层；bin: dsh-gitmemo
 ├── cordis.patch.yml      # 组合层：dsh-gitmemo 行
 ├── src/
-│   ├── index.ts          # Cordis 插件：mem_* 工具 + gitmemo 技能 + 提示词片段
-│   └── mem.ts            # 核心引擎（gitmemo scripts/mem.sh 的移植）
+│   ├── index.ts          # Cordis 插件：仅根 Agent 的 mem_* 工具 + 工作流片段
+│   ├── mem.ts            # 核心引擎（协议、锁/journal、搜索、write/read/delete/replace）
+│   ├── migrate.ts        # 旧格式迁移（dry-run/apply、backup refs、CAS 交换）
+│   └── cli.ts            # `dsh-gitmemo migrate` CLI 入口
 ├── lib/                  # 构建产物（已提交，供 file:/git 安装使用）
-└── test/mem.test.mjs     # 引擎 + 插件单元测试
+└── test/mem.test.mjs     # 引擎 + 插件 + 迁移单元测试
 ```
 
 ## License

@@ -1,7 +1,7 @@
 {
   "name": "@fonlan/dsh-gitmemo",
-  "version": "0.1.5",
-  "description": "Git-backed long-term memory for DeepSeek Harness: a local .mem git repo with mem_search / mem_read / mem_write / mem_delete tools, auto-managed by the agent with zero manual steps.",
+  "version": "0.2.0",
+  "description": "Git-backed long-term memory for DeepSeek Harness: a local .mem git repo (single main branch, immutable entries, structured commit messages) with mem_search / mem_read / mem_write / mem_delete / mem_replace tools and an explicit legacy-migration CLI, auto-managed by the root agent with zero manual steps.",
   "author": "fonlan",
   "publishConfig": {
     "access": "public"
@@ -13,6 +13,9 @@
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "bin": {
+    "dsh-gitmemo": "lib/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
@@ -22,6 +25,11 @@
       "types": "./lib/mem.d.ts",
       "default": "./lib/mem.js"
     },
+    "./migrate": {
+      "types": "./lib/migrate.d.ts",
+      "default": "./lib/migrate.js"
+    },
+    "./cli": "./lib/cli.js",
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
@@ -32,7 +40,7 @@
     "README.zh.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x lib/cli.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "npm run build && node --test",
     "prepublishOnly": "npm run build",

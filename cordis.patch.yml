@@ -3,9 +3,15 @@
 # Installing this package into a profile (`dsh plugin --profile <name> add @fonlan/dsh-gitmemo`)
 # appends it to `dsh.profile.bundles`; this patch is then applied as that
 # bundle's layer. The row below loads the package's main entry as a host-plane
-# plugin: it registers the `mem_init` / `mem_search` / `mem_read` /
-# `mem_write` / `mem_delete` tools on the shared tool registry, a runtime
-# `gitmemo` skill, and a system-prompt section pointing at the memory workflow.
+# plugin: at every ROOT-agent creation it scopes the
+# `mem_search` / `mem_read` / `mem_write` / `mem_delete` / `mem_replace`
+# tools plus the memory workflow system-prompt section into that agent
+# (subagents get neither). No session-start scanning, no Git I/O at
+# registration time.
+#
+# `memDirName` / `branchAlign` / `recentContextLimit` are deprecated and kept
+# only for one compatibility version (they are parsed but have no effect;
+# `.mem` is fixed at <projectRoot>/.mem and always stays on main).
 - insert:
     - id: dsh-gitmemo
       # Node-resolvable package name — must stay in sync with package.json
@@ -15,3 +21,4 @@
       config:
         memDirName: .mem
         searchLimit: 20
+        lockTimeoutMs: 30000
