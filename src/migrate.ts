@@ -2,9 +2,14 @@
  * Legacy → new-format migration for dsh-gitmemo (plan 10).
  *
  * Legacy `.mem` repos (no `.gitmemo-format` marker, possibly multi-branch)
- * are migrated through an explicit CLI only: `dsh-gitmemo migrate
- * --project-root <path> --dry-run` plans the migration (no refs are
- * touched), `--apply` executes it inside the cross-process lock:
+ * are migrated fully automatically by the engine: the first operation on a
+ * legacy repo runs dry-run + apply in one step (no `dsh-gitmemo` command
+ * needed). The CLI (`dsh-gitmemo migrate --project-root <path>
+ * --dry-run|--apply`) remains for explicit control — non-default --source
+ * directories, baseline review, and repos where automatic migration is
+ * blocked (conflicts, dirty worktree, ...).
+ *
+ * Apply mechanics:
  *  1. backup refs for every old branch tip (`refs/gitmemo/backup/<ts>/<b>`);
  *  2. a brand-new canonical `main` is built in a sibling temp repo (init
  *     commit + one immutable ADD commit per unique active entry);
@@ -114,6 +119,30 @@ export interface MigrationOptions {
   source?: string;
   gitTimeoutMs?: number;
   lockTimeoutMs?: number;
+}
+
+/** Why automatic migration could not run (user-resolvable blocking conditions). */
+export interface AutoMigrateBlock {
+  code: "no-repo" | "no-branches" | "conflicts" | "dirty" | "legacy-journal" | "other";
+  /** Human-readable detail; safe to surface to the user. */
+  detail: string;
+}
+
+/** Outcome of an automatic migration attempt (never throws for blocking conditions). */
+export interface AutoMigrateOutcome {
+  migrated: boolean;
+  alreadyNewFormat?: boolean;
+  blocked?: AutoMigrateBlock;
+  report?: MigrationApplyReport;
+}
+
+async function isGitRepo(dir: string, gitTimeoutMs: number): Promise<boolean> {
+  try {
+    await git(dir, ["rev-parse", "--git-dir"], gitTimeoutMs);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function listTips(memDir: string, gitTimeoutMs: number): Promise<{ branches: string[]; tips: Record<string, string> }> {
@@ -290,15 +319,19 @@ async function buildPlanEntry(args: {
  * ref, index or worktree state is modified (the lock file is transient).
  */
 export async function migrateDryRun(root: string, options: MigrationOptions = {}): Promise<MigrationDryRunReport> {
-  const gitTimeoutMs = options.gitTimeoutMs ?? 60000;
   const lockTimeoutMs = options.lockTimeoutMs ?? 30000;
+  return withLock(root, { lockTimeoutMs }, "migrate-dry-run", () => migrateDryRunUnlocked(root, options));
+}
+
+/** Unlocked core of {@link migrateDryRun}; the caller must hold the cross-process lock. */
+async function migrateDryRunUnlocked(root: string, options: MigrationOptions = {}): Promise<MigrationDryRunReport> {
+  const gitTimeoutMs = options.gitTimeoutMs ?? 60000;
   const memDir = resolve(options.source ?? join(root, ".mem"));
-  return withLock(root, { lockTimeoutMs }, "migrate-dry-run", async () => {
-    try {
-      await git(memDir, ["rev-parse", "--git-dir"], gitTimeoutMs);
-    } catch {
-      throw new GitMemoError("gitmemo: no .mem repository at " + memDir);
-    }
+  try {
+    await git(memDir, ["rev-parse", "--git-dir"], gitTimeoutMs);
+  } catch {
+    throw new GitMemoError("gitmemo: no .mem repository at " + memDir);
+  }
     if ((await repoFormat(memDir, gitTimeoutMs)) === "new") {
       return {
         legacy: false,
@@ -417,7 +450,6 @@ export async function migrateDryRun(root: string, options: MigrationOptions = {}
       baseline,
       warnings
     };
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -468,8 +500,13 @@ async function excludeFromParent(root: string, gitTimeoutMs: number): Promise<vo
  * new canonical main in a temp repo, then swaps directories atomically.
  */
 export async function migrateApply(root: string, baseline: MigrationBaseline, options: MigrationOptions = {}): Promise<MigrationApplyReport> {
-  const gitTimeoutMs = options.gitTimeoutMs ?? 60000;
   const lockTimeoutMs = options.lockTimeoutMs ?? 30000;
+  return withLock(root, { lockTimeoutMs }, "migrate", () => migrateApplyUnlocked(root, baseline, options));
+}
+
+/** Unlocked core of {@link migrateApply}; the caller must hold the cross-process lock. */
+async function migrateApplyUnlocked(root: string, baseline: MigrationBaseline, options: MigrationOptions = {}): Promise<MigrationApplyReport> {
+  const gitTimeoutMs = options.gitTimeoutMs ?? 60000;
   if (
     baseline === null ||
     typeof baseline !== "object" ||
@@ -497,8 +534,7 @@ export async function migrateApply(root: string, baseline: MigrationBaseline, op
   if (resolve(baseline.memDir) !== memDir) {
     throw new GitMemoError("gitmemo: migration baseline source path is inconsistent — re-run --dry-run");
   }
-  return withLock(root, { lockTimeoutMs }, "migrate", async () => {
-    await recoverMigrationSwap(root, gitTimeoutMs);
+  await recoverMigrationSwap(root, gitTimeoutMs);
     if ((await repoFormat(memDir, gitTimeoutMs)) === "new") {
       return { migrated: false, alreadyMigrated: true, entries: 0, newMain: "", backupRefPrefix: "", oldBranches: [] };
     }
@@ -683,5 +719,65 @@ export async function migrateApply(root: string, baseline: MigrationBaseline, op
       await rm(tmp, { recursive: true, force: true }).catch(() => {});
       throw error;
     }
-  });
+}
+
+/**
+ * Fully automatic migration for engine use: dry-run + apply in one step,
+ * without taking the cross-process lock (the caller must already hold it).
+ *
+ * Never throws for user-resolvable blocking conditions — it returns
+ * `blocked` instead, so the caller can fall back to legacy read-only mode
+ * and retry automatically on a later operation.
+ */
+export async function migrateAutoUnlocked(root: string, options: MigrationOptions = {}): Promise<AutoMigrateOutcome> {
+  const gitTimeoutMs = options.gitTimeoutMs ?? 60000;
+  const memDir = resolve(options.source ?? join(root, ".mem"));
+  await recoverMigrationSwap(root, gitTimeoutMs);
+  if (!(await isGitRepo(memDir, gitTimeoutMs))) {
+    return { migrated: false, blocked: { code: "no-repo", detail: "no .mem repository at " + memDir } };
+  }
+  if ((await repoFormat(memDir, gitTimeoutMs)) === "new") {
+    return { migrated: false, alreadyNewFormat: true };
+  }
+  let report: MigrationDryRunReport;
+  try {
+    report = await migrateDryRunUnlocked(root, options);
+  } catch (error) {
+    if (error instanceof GitMemoError) {
+      const code: AutoMigrateBlock["code"] = /no branches/.test(error.message) ? "no-branches" : "other";
+      return { migrated: false, blocked: { code, detail: error.message } };
+    }
+    throw error;
+  }
+  if (!report.legacy) return { migrated: false, alreadyNewFormat: true };
+  if (report.conflictCount > 0) {
+    return {
+      migrated: false,
+      blocked: {
+        code: "conflicts",
+        detail:
+          `${report.conflictCount} conflict(s) (same entry path, different content across branches):\n` +
+          conflictManifest(report.baseline.conflicts)
+      }
+    };
+  }
+  try {
+    const applied = await migrateApplyUnlocked(root, report.baseline, options);
+    return {
+      migrated: applied.migrated,
+      ...(applied.alreadyMigrated === true ? { alreadyNewFormat: true } : {}),
+      report: applied
+    };
+  } catch (error) {
+    if (error instanceof GitMemoError) {
+      const message = error.message;
+      let code: AutoMigrateBlock["code"] = "other";
+      if (/blocked by \d+ conflict/.test(message)) code = "conflicts";
+      else if (/not clean.*refuses to discard/.test(message)) code = "dirty";
+      else if (/interrupted transaction journal/.test(message)) code = "legacy-journal";
+      else if (/baseline contains no branches/.test(message)) code = "no-branches";
+      return { migrated: false, blocked: { code, detail: message } };
+    }
+    throw error;
+  }
 }

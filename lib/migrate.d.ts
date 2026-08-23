@@ -60,6 +60,19 @@ export interface MigrationOptions {
     gitTimeoutMs?: number;
     lockTimeoutMs?: number;
 }
+/** Why automatic migration could not run (user-resolvable blocking conditions). */
+export interface AutoMigrateBlock {
+    code: "no-repo" | "no-branches" | "conflicts" | "dirty" | "legacy-journal" | "other";
+    /** Human-readable detail; safe to surface to the user. */
+    detail: string;
+}
+/** Outcome of an automatic migration attempt (never throws for blocking conditions). */
+export interface AutoMigrateOutcome {
+    migrated: boolean;
+    alreadyNewFormat?: boolean;
+    blocked?: AutoMigrateBlock;
+    report?: MigrationApplyReport;
+}
 /**
  * Scan a legacy `.mem` repo and produce the migration plan. Read-only: no
  * ref, index or worktree state is modified (the lock file is transient).
@@ -71,3 +84,12 @@ export declare function migrateDryRun(root: string, options?: MigrationOptions):
  * new canonical main in a temp repo, then swaps directories atomically.
  */
 export declare function migrateApply(root: string, baseline: MigrationBaseline, options?: MigrationOptions): Promise<MigrationApplyReport>;
+/**
+ * Fully automatic migration for engine use: dry-run + apply in one step,
+ * without taking the cross-process lock (the caller must already hold it).
+ *
+ * Never throws for user-resolvable blocking conditions — it returns
+ * `blocked` instead, so the caller can fall back to legacy read-only mode
+ * and retry automatically on a later operation.
+ */
+export declare function migrateAutoUnlocked(root: string, options?: MigrationOptions): Promise<AutoMigrateOutcome>;

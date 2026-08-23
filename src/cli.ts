@@ -5,6 +5,11 @@
  *   dsh-gitmemo migrate --project-root <path> [--dry-run|--apply]
  *     [--source <legacy-mem-dir>] [--out <baseline-file>] [--baseline <file>]
  *
+ * Migration is AUTOMATIC inside the engine (the first operation on a legacy
+ * `.mem` repo migrates it in place). This CLI remains for explicit control:
+ * non-default --source directories, baseline review, and repos where
+ * automatic migration is blocked (conflicts, dirty worktree, ...).
+ *
  * Dry-run scans the legacy `.mem` repo without touching any ref/index/work
  * tree state and prints the plan (dedupe, conflicts, estimated commits).
  * `--apply` re-verifies the baseline refs, then migrates inside the

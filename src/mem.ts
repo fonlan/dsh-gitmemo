@@ -22,6 +22,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { access, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { AutoMigrateOutcome } from "./migrate.js";
 
 /** Schema version stored in `.gitmemo-format`. */
 export const GITMEMO_FORMAT_VERSION = "2";
@@ -937,10 +938,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-function legacyWarning(root: string): string {
+function legacyWarning(): string {
   return (
-    "gitmemo: .mem is in legacy format — search is read-only over the current branch. " +
-    `Run \`dsh-gitmemo migrate --project-root ${root} --dry-run\` to plan migration (then --apply).`
+    "gitmemo: .mem is in legacy format and automatic migration is blocked — search is read-only over the current branch"
+  );
+}
+
+/** Refusal message for write/delete/replace when automatic migration cannot run. */
+function legacyWriteRefusal(outcome: AutoMigrateOutcome): string {
+  const detail = outcome.blocked?.detail ?? "unknown blocking condition";
+  return (
+    "gitmemo: .mem exists in legacy format — write operations are disabled and automatic migration is blocked: " + detail
   );
 }
 
@@ -1051,9 +1059,9 @@ async function resolveSnapshot(
       if (!(await gitOk(memDir, ["merge-base", "--is-ancestor", full, head], gitTimeoutMs))) {
         throw new GitMemoError(`gitmemo: stale legacy snapshot ${input} is no longer part of the current HEAD history — restart pagination`);
       }
-      return { snapshot: full, legacy: true, warning: legacyWarning(root) };
+      return { snapshot: full, legacy: true, warning: legacyWarning() };
     }
-    return { snapshot: head, legacy: true, warning: legacyWarning(root) };
+    return { snapshot: head, legacy: true, warning: legacyWarning() };
   }
   const format = await repoFormat(memDir, gitTimeoutMs, main);
   if (format !== "new") {
@@ -1062,9 +1070,9 @@ async function resolveSnapshot(
       if (!(await gitOk(memDir, ["merge-base", "--is-ancestor", full, main], gitTimeoutMs))) {
         throw new GitMemoError(`gitmemo: stale legacy snapshot ${input} is no longer part of the current branch history — restart pagination`);
       }
-      return { snapshot: full, legacy: true, warning: legacyWarning(root) };
+      return { snapshot: full, legacy: true, warning: legacyWarning() };
     }
-    return { snapshot: main, legacy: true, warning: legacyWarning(root) };
+    return { snapshot: main, legacy: true, warning: legacyWarning() };
   }
   if (input !== undefined) {
     const full = await resolveCommit(memDir, input, gitTimeoutMs);
@@ -1341,17 +1349,6 @@ async function assertOnMain(memDir: string, gitTimeoutMs: number): Promise<void>
   }
 }
 
-/** Write/delete/replace must run on the new format; legacy repos need migration. */
-async function assertNewFormat(memDir: string, gitTimeoutMs: number, root: string): Promise<void> {
-  const format = await repoFormat(memDir, gitTimeoutMs);
-  if (format !== "new") {
-    throw new GitMemoError(
-      "gitmemo: .mem exists in legacy format — write operations are disabled. " +
-        `Run \`dsh-gitmemo migrate --project-root ${root} --dry-run\` to plan migration, then --apply.`
-    );
-  }
-}
-
 /** Current code branch + HEAD SHA for entry metadata (plan 7.2/7.3). */
 async function codeContext(root: string, gitTimeoutMs: number): Promise<CodeContext> {
   try {
@@ -1492,8 +1489,10 @@ function cacheSearch(key: string, value: SearchComputation): void {
 
 /**
  * Git-backed long-term memory engine operating on one project root.
- * Every operation auto-initializes a new-format repo; legacy repos are
- * read-only for search/read until migrated via the CLI.
+ * Every operation auto-initializes a new-format repo; legacy `.mem` repos
+ * are migrated automatically on first use (no external CLI needed). Only
+ * when automatic migration is blocked (conflicts, dirty worktree, ...) do
+ * legacy repos stay read-only for search/read with a clear warning.
  */
 export class GitMemo {
   readonly root: string;
@@ -1517,12 +1516,45 @@ export class GitMemo {
     this.memDir = join(this.root, ".mem");
   }
 
-  /** Initialize the memory repo when missing (idempotent). */
+  /** Initialize the memory repo when missing (idempotent). Legacy repos are migrated automatically. */
   async init(): Promise<string> {
     await withLock(this.root, this.config, "init", async () => {
       await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
+      await this.autoMigrateIfNeeded();
     });
     return this.memDir;
+  }
+
+  /**
+   * Fully automatic legacy migration (no external CLI needed): when `.mem`
+   * exists in legacy format, rebuild it into the new format in place —
+   * dry-run + apply in one step. The caller must already hold the operation
+   * lock. Blocking conditions (conflicts, dirty worktree, interrupted legacy
+   * journal, ...) are returned, never thrown, so operations can fall back to
+   * legacy read-only behavior; the next operation retries automatically.
+   */
+  private async autoMigrateIfNeeded(): Promise<AutoMigrateOutcome> {
+    if (!(await pathExists(join(this.memDir, ".git")))) {
+      return { migrated: false, blocked: { code: "no-repo", detail: "no .mem repository" } };
+    }
+    if ((await repoFormat(this.memDir, this.config.gitTimeoutMs)) === "new") {
+      return { migrated: false, alreadyNewFormat: true };
+    }
+    const { migrateAutoUnlocked } = await import("./migrate.js");
+    return migrateAutoUnlocked(this.root, {
+      gitTimeoutMs: this.config.gitTimeoutMs,
+      lockTimeoutMs: this.config.lockTimeoutMs
+    });
+  }
+
+  /** Ensure the repo is initialized and writable (new format), migrating legacy repos automatically. */
+  private async ensureWritable(): Promise<void> {
+    await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
+    const migration = await this.autoMigrateIfNeeded();
+    if (migration.alreadyNewFormat === true) return; // fresh/new-format repo — nothing to migrate
+    if (!migration.migrated) {
+      throw new GitMemoError(legacyWriteRefusal(migration));
+    }
   }
 
   /**
@@ -1565,12 +1597,19 @@ export class GitMemo {
         : undefined;
 
     // Read barrier: resolve the immutable snapshot under the lock (creating
-    // the repo when missing), then scan without holding it.
-    const { snapshot, legacy, warning } = await withLock(this.root, this.config, "search", async () => {
+    // the repo when missing; legacy repos are migrated automatically when
+    // safe), then scan without holding it.
+    const { snapshot, legacy, warning, blockedNote } = await withLock(this.root, this.config, "search", async () => {
       if (!(await pathExists(join(this.memDir, ".git")))) {
         await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
       }
-      return resolveSnapshot(this.memDir, this.config.gitTimeoutMs, this.root, requestedSnapshot);
+      const migration = await this.autoMigrateIfNeeded();
+      const resolved = await resolveSnapshot(this.memDir, this.config.gitTimeoutMs, this.root, requestedSnapshot);
+      const note =
+        !migration.migrated && migration.blocked !== undefined && resolved.legacy
+          ? " Automatic migration was attempted but blocked: " + migration.blocked.detail
+          : undefined;
+      return { ...resolved, blockedNote: note };
     });
 
     const cacheKey = this.memDir + "\x00" + snapshot + "\x00" + normalized.join("\x00");
@@ -1582,7 +1621,7 @@ export class GitMemo {
 
     const total = computation.hits.length;
     const next_skip = skip + limit < total ? skip + limit : null;
-    const allWarnings = [adapterWarning, warning].filter((w) => w !== undefined).join(" ");
+    const allWarnings = [adapterWarning, warning, blockedNote].filter((w) => w !== undefined).join(" ");
     return {
       snapshot,
       total,
@@ -1668,6 +1707,7 @@ export class GitMemo {
       if (!(await pathExists(join(this.memDir, ".git")))) {
         await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
       }
+      await this.autoMigrateIfNeeded();
       const full = await resolveCommit(this.memDir, commitHash, this.config.gitTimeoutMs);
       const added = await addedFilesOf(this.memDir, full, this.config.gitTimeoutMs);
       if (added.length !== 1) {
@@ -1692,8 +1732,7 @@ export class GitMemo {
     const validated = validateWriteInput(adapted, legacy);
     const digest = computeDigest(validated.title, validated.summary, validated.keywords, validated.content);
     return withLock(this.root, this.config, "write", async () => {
-      await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
-      await assertNewFormat(this.memDir, this.config.gitTimeoutMs, this.root);
+      await this.ensureWritable();
       await recoverJournal(this.memDir, this.config.gitTimeoutMs);
       await assertClean(this.memDir, this.config.gitTimeoutMs);
       await assertOnMain(this.memDir, this.config.gitTimeoutMs);
@@ -1762,8 +1801,7 @@ export class GitMemo {
     assertNoControlChars(reason, "reason");
     assertNoTrailerInjection(reason, "reason");
     return withLock(this.root, this.config, "delete", async () => {
-      await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
-      await assertNewFormat(this.memDir, this.config.gitTimeoutMs, this.root);
+      await this.ensureWritable();
       await recoverJournal(this.memDir, this.config.gitTimeoutMs);
       await assertClean(this.memDir, this.config.gitTimeoutMs);
       await assertOnMain(this.memDir, this.config.gitTimeoutMs);
@@ -1812,8 +1850,7 @@ export class GitMemo {
     const validated = validateWriteInput(input);
     const digest = computeDigest(validated.title, validated.summary, validated.keywords, validated.content);
     return withLock(this.root, this.config, "replace", async () => {
-      await ensureInit(this.root, this.memDir, this.config.gitTimeoutMs);
-      await assertNewFormat(this.memDir, this.config.gitTimeoutMs, this.root);
+      await this.ensureWritable();
       await recoverJournal(this.memDir, this.config.gitTimeoutMs);
       await assertClean(this.memDir, this.config.gitTimeoutMs);
       await assertOnMain(this.memDir, this.config.gitTimeoutMs);

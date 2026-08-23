@@ -845,22 +845,64 @@ function makeLegacyMem(root) {
   return mem;
 }
 
-test("legacy repo: search/read are read-only with a migration warning; writes are refused", async () => {
+test("legacy repo auto-migrates on the first engine operation (no CLI needed)", async () => {
   const root = makeRepo();
   const mem = makeLegacyMem(root);
-  const memo = new GitMemo(root);
+  // cross-branch memory: automatic migration merges every branch into the canonical main
+  execFileSync("git", ["checkout", "-q", "-b", "side"], { cwd: mem });
+  writeFileSync(join(mem, "entries", "20260103T000000Z-side.md"), "### Final Outcome\nSide branch memory.", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd: mem });
+  execFileSync("git", ["commit", "-q", "-m", "[side] memory"], { cwd: mem });
+  execFileSync("git", ["checkout", "-q", "main"], { cwd: mem });
+  const oldOneHash = git(mem, ["log", "-1", "--format=%H", "--", "entries/20260101T000000Z-legacy-one.md"]);
 
+  const memo = new GitMemo(root);
   const found = await memo.search(["legacy"]);
   assert.equal(found.results.length, 2);
+  assert.equal(found.legacy, undefined);
+  assert.equal(found.warning, undefined);
+  // repo converted in place to the new format
+  assert.equal(readFileSync(join(root, ".mem", ".gitmemo-format"), "utf8").trim(), "2");
+  assert.equal(git(join(root, ".mem"), ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+  // every branch's memory is now searchable
+  const side = await memo.search(["side"]);
+  assert.equal(side.results.length, 1);
+  // writes now work without any CLI
+  const w = await memo.write({ title: "[x] after auto", summary: "s", keywords: ["auto", "migrate"], content: "c" });
+  assert.match(w.hash, /^[0-9a-f]{40}$/);
+  // old legacy hashes stay readable through the backup refs
+  const oldEntry = await memo.read(oldOneHash);
+  assert.equal(oldEntry.legacy, true);
+  assert.ok(oldEntry.content.includes("Legacy entry one."));
+  // no leftovers
+  assert.equal(git(join(root, ".mem"), ["status", "--porcelain"]), "");
+  assert.ok(!existsSync(join(root, ".mem.gitmemo.lock")));
+  assert.ok(!existsSync(join(root, MIGRATION_JOURNAL_NAME)));
+});
+
+test("legacy repo with conflicts: auto-migration is blocked and search stays read-only", async () => {
+  const root = makeRepo();
+  const mem = makeLegacyMem(root);
+  execFileSync("git", ["checkout", "-q", "-b", "feature"], { cwd: mem });
+  writeFileSync(join(mem, "entries", "20260102T000000Z-legacy-two.md"), "conflicting content", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd: mem });
+  execFileSync("git", ["commit", "-q", "-m", "[legacy] two edit"], { cwd: mem });
+  execFileSync("git", ["checkout", "-q", "main"], { cwd: mem });
+
+  const memo = new GitMemo(root);
+  const found = await memo.search(["legacy"]);
+  assert.equal(found.results.length, 2); // read-only over main
   assert.equal(found.legacy, true);
   assert.match(found.warning, /legacy format/);
-
+  assert.match(found.warning, /automatic migration.*blocked/s);
+  assert.match(found.warning, /conflict/);
+  // read still works read-only
   const read = await memo.read(found.results[0].hash);
   assert.equal(read.legacy, true);
-
+  // writes are refused with the block reason
   await assert.rejects(
     () => memo.write({ title: "[x] no", summary: "s", keywords: ["a", "b"], content: "c" }),
-    /legacy format.*migrate/s
+    /legacy format.*blocked.*conflict/s
   );
   await assert.rejects(
     () => memo.delete({ commit_hash: found.results[0].hash, reason: "x" }),
@@ -870,29 +912,58 @@ test("legacy repo: search/read are read-only with a migration warning; writes ar
     () => memo.replace({ commit_hash: found.results[0].hash, title: "t", summary: "s", keywords: ["a", "b"], content: "c" }),
     /legacy format/
   );
-  // no --all cross-branch leakage: an extra branch is invisible
-  execFileSync("git", ["checkout", "-q", "-b", "side"], { cwd: mem });
-  writeFileSync(join(mem, "entries", "20260103T000000Z-side.md"), "side branch memory", "utf8");
-  execFileSync("git", ["add", "-A"], { cwd: mem });
-  execFileSync("git", ["commit", "-q", "-m", "[side] hidden"], { cwd: mem });
-  execFileSync("git", ["checkout", "-q", "main"], { cwd: mem });
-  const after = await memo.search(["hidden"]);
-  assert.equal(after.results.length, 0);
+  // repo untouched: still legacy (no format marker)
+  assert.equal(existsSync(join(root, ".mem", ".gitmemo-format")), false);
 });
 
-test("legacy search honors a stable snapshot and engine legacy write adapter converts old fields", async () => {
+test("dirty legacy repo: auto-migration blocked; the next operation migrates after cleanup", async () => {
   const root = makeRepo();
   const mem = makeLegacyMem(root);
+  writeFileSync(join(mem, "entries", "uncommitted.md"), "do not discard", "utf8");
+
+  const memo = new GitMemo(root);
+  const found = await memo.search(["legacy"]);
+  assert.equal(found.legacy, true);
+  assert.match(found.warning, /blocked/);
+  await assert.rejects(
+    () => memo.write({ title: "[d] blocked", summary: "s", keywords: ["dirty", "two"], content: "2" }),
+    /legacy format.*blocked.*not clean/s
+  );
+  assert.ok(existsSync(join(mem, "entries", "uncommitted.md")), "dirty content untouched");
+
+  // user cleans up → the next operation migrates automatically
+  execFileSync("git", ["add", "-A"], { cwd: mem });
+  execFileSync("git", ["commit", "-q", "-m", "cleanup work"], { cwd: mem });
+  const after = await memo.search(["legacy"]);
+  assert.equal(after.legacy, undefined);
+  assert.equal(after.results.length, 2);
+  assert.equal(readFileSync(join(root, ".mem", ".gitmemo-format"), "utf8").trim(), "2");
+});
+
+test("legacy search honors a stable snapshot when auto-migration is blocked", async () => {
+  const root = makeRepo();
+  const mem = makeLegacyMem(root);
+  execFileSync("git", ["checkout", "-q", "-b", "feature"], { cwd: mem });
+  writeFileSync(join(mem, "entries", "20260102T000000Z-legacy-two.md"), "conflict", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd: mem });
+  execFileSync("git", ["commit", "-q", "-m", "[legacy] two edit"], { cwd: mem });
+  execFileSync("git", ["checkout", "-q", "main"], { cwd: mem });
+
   const memo = new GitMemo(root);
   const first = await memo.search(["legacy"]);
+  assert.equal(first.legacy, true);
   writeFileSync(join(mem, "entries", "later.md"), "later legacy", "utf8");
   execFileSync("git", ["add", "-A"], { cwd: mem });
   execFileSync("git", ["commit", "-q", "-m", "[legacy] later", "-m", "later legacy"], { cwd: mem });
   const stable = await memo.search(["legacy"], { snapshot: first.snapshot });
   assert.equal(stable.total, first.total);
+  const fresh = await memo.search(["legacy"]);
+  assert.equal(fresh.total, first.total + 1);
+});
 
-  // Adapter is engine-facing: body/content_file are converted deterministically.
-  rmSync(mem, { recursive: true, force: true });
+test("engine legacy write adapter converts old fields deterministically", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
   const contentFile = join(root, "legacy-content.md");
   writeFileSync(contentFile, "legacy adapter body", "utf8");
   const adapted = await memo.write({

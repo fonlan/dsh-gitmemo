@@ -262,16 +262,29 @@ export declare function rollbackJournal(memDir: string, journal: TransactionJour
 export declare function ensureInit(root: string, memDir: string, gitTimeoutMs: number): Promise<void>;
 /**
  * Git-backed long-term memory engine operating on one project root.
- * Every operation auto-initializes a new-format repo; legacy repos are
- * read-only for search/read until migrated via the CLI.
+ * Every operation auto-initializes a new-format repo; legacy `.mem` repos
+ * are migrated automatically on first use (no external CLI needed). Only
+ * when automatic migration is blocked (conflicts, dirty worktree, ...) do
+ * legacy repos stay read-only for search/read with a clear warning.
  */
 export declare class GitMemo {
     readonly root: string;
     readonly memDir: string;
     private readonly config;
     constructor(root: string, config?: GitMemoConfig);
-    /** Initialize the memory repo when missing (idempotent). */
+    /** Initialize the memory repo when missing (idempotent). Legacy repos are migrated automatically. */
     init(): Promise<string>;
+    /**
+     * Fully automatic legacy migration (no external CLI needed): when `.mem`
+     * exists in legacy format, rebuild it into the new format in place —
+     * dry-run + apply in one step. The caller must already hold the operation
+     * lock. Blocking conditions (conflicts, dirty worktree, interrupted legacy
+     * journal, ...) are returned, never thrown, so operations can fall back to
+     * legacy read-only behavior; the next operation retries automatically.
+     */
+    private autoMigrateIfNeeded;
+    /** Ensure the repo is initialized and writable (new format), migrating legacy repos automatically. */
+    private ensureWritable;
     /**
      * Search past memories (plan 6): fixed-string OR grep recall over commit
      * messages only, active-entry filtering, field-level matching and scoring,
