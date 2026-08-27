@@ -103,7 +103,9 @@ git -C .mem show <commit-hash>
    `mem_write` every completed repo-related task that still lacks a memory and whose outcome is
    **valuable/reusable** (or was explicitly asked to be remembered). Never duplicate an
    already-written entry. Never write for pure Q&A, incomplete tasks, non-repo work, or purely
-   operational git actions.
+   operational git actions. `keywords` should be task-related words NOT already present in
+   `title` / `summary` (中英文同义词 both fine) — words already there are searchable via
+   `title` / `summary` themselves, so repeating them does not improve recall.
 4. **User correction.** If a stored conclusion is outdated and a replacement exists →
    `mem_replace` (never delete-then-write). If it is obsolete with no replacement →
    `mem_delete` with a `reason`.
