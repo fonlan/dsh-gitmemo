@@ -49,8 +49,8 @@
     "release:major": "npm version major && git push && git push --tags"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/dsh-tools": "^0.1.2-alpha.2",
+    "@deepseek-ai/schemastery": "^3.18.2",
     "@types/node": "^26.2.0",
     "typescript": "^5.5.0"
   },
