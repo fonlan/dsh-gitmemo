@@ -623,7 +623,8 @@ async function migrateApplyUnlocked(root: string, baseline: MigrationBaseline, o
             keywords: entry.keywords,
             content: entry.content,
             related_branches: entry.relatedBranches,
-            related_paths: entry.relatedPaths
+            related_paths: entry.relatedPaths,
+            kind: "task"
           },
           { branch: entry.codeBranch, commit: entry.codeCommit, relatedBranches: entry.relatedBranches },
           entry.digest,

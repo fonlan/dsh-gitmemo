@@ -16,6 +16,9 @@ dependency, and no manual memory commands are ever needed.
 - **Git-only** — no runtime dependency beyond the `git` CLI
 - **Token-efficient** — reuses prior conclusions via `mem_search`; subagents carry neither the workflow rules nor the tool schemas
 - **Immutable entries** — every write creates a new file; corrections use `mem_replace` (one commit deletes the old file and adds the new one), withdrawal uses `mem_delete`
+- **Knowledge freshness** — `mem_replace` is not just for user corrections: work that overrules a stored conclusion actively replaces it; `mem_search` scores hits as distinct matched keywords + a mild recency bonus (≤ +0.5, linearly decaying to 0 over ~180 days), so conflicting stale conclusions lose to their replacements
+- **Topic pages (MOC)** — a `kind: "topic"` entry aggregates a topic's "current truth": the summary states the currently-valid conclusions and the page evolves via `mem_replace` (kind is inherited), not per-task rewrites
+- **Wiki links between entries** — content references other entries as `[[<commit-hash>]]`; `mem_read` with `expand: true` resolves those links one hop and automatically follows the `GitMemo-Replaces` chain to a replaced target's active version (dangling links come back with an error)
 - **Structured search** — commit messages carry `GitMemo-*` trailers (keywords, digest, search-text projections); search is `git log --grep --fixed-strings` over commit messages only — entry bodies are never scanned
 - **Auditable** — every memory action is a commit in `.mem`'s Git history; replaced/deleted entries stay readable by hash
 - **Crash-safe** — write/delete/replace run under a cross-process lock with a journal written before entry mutation; migration uses a sibling swap journal so an interrupted directory exchange is recovered before automatic initialization
@@ -25,11 +28,11 @@ dependency, and no manual memory commands are ever needed.
 
 | Piece | Description |
 | --- | --- |
-| `mem_search` | Search memories: `keywords` (array of 1–12, 中英文同义词), `skip` + `snapshot` (stable pagination). Returns up to 20 scored hits with `summary` / `keywords` / `matched_keywords` |
-| `mem_read` | Read one memory entry by create/replace commit hash (full markdown; historical hashes stay readable) |
-| `mem_write` | Store a task outcome: `title` + `summary` + `keywords` (2–12) + `content` (engine generates front matter), optional `related_branches` / `related_paths`. One ADD commit per immutable file |
+| `mem_search` | Search memories: `keywords` (array of 1–12, 中英文同义词), `skip` + `snapshot` (stable pagination). Returns up to 20 scored hits with `summary` / `keywords` / `kind` / `matched_keywords` (score = matched keywords + recency bonus) |
+| `mem_read` | Read one memory entry by create/replace commit hash (full markdown; historical hashes stay readable); returns `kind`; optional `expand: true` resolves `[[hash]]` links one hop |
+| `mem_write` | Store a task outcome: `title` + `summary` + `keywords` (2–12) + `content` (engine generates front matter), optional `kind` (`"task"` default / `"topic"` aggregated page), `related_branches` / `related_paths`. One ADD commit per immutable file |
 | `mem_delete` | Withdraw an obsolete conclusion (requires `commit_hash` + `reason`) |
-| `mem_replace` | Correct an outdated conclusion in ONE atomic commit (D old + A new) — never delete-then-write |
+| `mem_replace` | Correct an outdated conclusion in ONE atomic commit (D old + A new) — never delete-then-write. Triggered by user corrections AND by work that overrules a stored conclusion; `kind` defaults to the replaced entry's kind |
 | Scoped rules | The workflow rules + the five tools are registered into **root agents only** (`delegationDepth === 0`) at `agent/created`; subagents carry neither |
 
 ## Installation
@@ -83,7 +86,8 @@ The `.mem` repository lives at the **project root** of the calling session's wor
   `.gitignore`), and refuses to run when the parent repo already tracks `.mem` content.
 - Every write creates a brand-new file with an exclusive create (never overwrites), commits
   one ADD commit with structured trailers, and records the code branch/SHA/related paths in
-  the entry front matter.
+  the entry front matter. Front matter always carries `kind` (`"task"` or `"topic"`); topic
+  entries additionally carry a `GitMemo-Kind: topic` commit trailer.
 
 The whole memory stays readable with plain `git`:
 
@@ -97,7 +101,8 @@ git -C .mem show <commit-hash>
 1. **Before work — search.** For repo-related tasks, extract 1–12 中英文关键词 → `mem_search`.
    Pure chat and general Q&A need no search.
 2. **Preselect results.** Based on `title` / `summary` / `keywords` / `score` /
-   `matched_keywords`, `mem_read` at most 5 most relevant memories; paginate with `skip` +
+   `matched_keywords`, `mem_read` at most 5 most relevant memories (`kind: "topic"` entries
+   are a topic's aggregated entry point — prefer them); paginate with `skip` +
    the returned `snapshot`.
 3. **End-of-session checkpoint — the only write path.** When the conversation is ending,
    `mem_write` every completed repo-related task that still lacks a memory and whose outcome is
@@ -106,10 +111,17 @@ git -C .mem show <commit-hash>
    operational git actions. `keywords` should be task-related words NOT already present in
    `title` / `summary` (中英文同义词 both fine) — words already there are searchable via
    `title` / `summary` themselves, so repeating them does not improve recall.
-4. **User correction.** If a stored conclusion is outdated and a replacement exists →
+4. **Keep fresh.** If the user corrects a stored conclusion and a replacement exists →
    `mem_replace` (never delete-then-write). If it is obsolete with no replacement →
-   `mem_delete` with a `reason`.
-5. **Subagent results.** Only the root agent decides whether a session-level memory is written.
+   `mem_delete` with a `reason`. The same applies — without waiting for the user — when this
+   session's own work overrules a stored conclusion (implemented/refactored away). When search
+   returns conflicting old/new conclusions, trust the newer one (score already includes the
+   recency bonus).
+5. **Topic pages.** Once a topic has accumulated several memories — or needs a "current truth"
+   entry point — write one `kind: "topic"` aggregated entry: the summary states the currently
+   valid conclusions, and the content links the evidence entries as `[[<commit-hash>]]` with a
+   one-line status each; evolve topic pages via `mem_replace`.
+6. **Subagent results.** Only the root agent decides whether a session-level memory is written.
 
 ## Development
 

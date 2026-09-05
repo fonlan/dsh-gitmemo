@@ -35,6 +35,14 @@ export interface SearchHit {
     date: string;
     summary: string;
     keywords: string[];
+    /** Entry kind: `task` (task-outcome record) or `topic` (aggregated topic page). */
+    kind: "task" | "topic";
+    /**
+     * Relevance = distinct matched keywords + a mild recency bonus (at most
+     * +0.5, linearly decaying to 0 between 30 and 180 days of age). The bonus
+     * never outweighs an extra matched keyword, so it only reorders entries
+     * with equal match counts.
+     */
     score: number;
     matched_keywords: string[];
 }
@@ -65,6 +73,12 @@ export interface WriteInput {
     content: string;
     related_branches?: string[];
     related_paths?: string[];
+    /**
+     * Entry kind. `task` (default) is a task-outcome record; `topic` is an
+     * aggregated topic page (MOC) whose content links evidence entries via
+     * `[[<commit-hash>]]` and is evolved with mem_replace, not rewritten per task.
+     */
+    kind?: "task" | "topic";
 }
 /** One-version compatibility shape accepted by the engine, not model-facing tools. */
 export interface LegacyWriteInput {
@@ -85,11 +99,41 @@ export interface WriteResult {
     file: string;
     legacy?: boolean;
 }
+/** Options for {@link GitMemo.read}. */
+export interface ReadOptions {
+    /**
+     * Resolve `[[<commit-hash>]]` links found in the entry content one hop to
+     * their target entries. Link targets automatically follow forward to the
+     * ACTIVE version of the linked entry file, so a topic page link survives
+     * its targets being replaced; the original link hash stays recorded.
+     */
+    expand?: boolean;
+}
+/** One-hop resolution of a `[[<commit-hash>]]` link inside an entry. */
+export interface LinkedEntryResolution {
+    /** Hash exactly as written inside the [[...]] link (lowercased). */
+    link_hash: string;
+    /** Hash actually read: the active version of the linked entry file ("" when unresolvable). */
+    resolved_hash: string;
+    /** True when the link hash still IS the active version (false = superseded or dangling). */
+    active: boolean;
+    file?: string;
+    title?: string;
+    summary?: string;
+    keywords?: string[];
+    kind?: "task" | "topic";
+    /** Present instead of title/summary when the link target cannot be resolved. */
+    error?: string;
+}
 export interface ReadResult {
     hash: string;
     file: string;
     content: string;
+    /** Entry kind parsed from the create/replace commit (legacy entries read as "task"). */
+    kind: "task" | "topic";
     legacy?: boolean;
+    /** Present only when the read was requested with `expand: true`. */
+    links?: LinkedEntryResolution[];
 }
 export interface DeleteInput {
     commit_hash: string;
@@ -104,6 +148,8 @@ export interface ParsedCommitMessage {
     summary: string;
     type: "add" | "replace" | "delete" | "unknown";
     keywords: string[];
+    /** Entry kind from the `GitMemo-Kind` trailer; absence means "task". */
+    kind: "task" | "topic";
     digest?: string;
     deletes?: string;
     replaces?: string;
@@ -176,6 +222,7 @@ export interface ValidatedWriteInput {
     content: string;
     related_branches: string[];
     related_paths: string[];
+    kind: "task" | "topic";
 }
 /**
  * Validate a write/replace payload (plan 5.3). `legacy` relaxes the keyword
@@ -190,7 +237,7 @@ export declare function validateWriteInput(input: WriteInput, legacy?: boolean):
  * an exact duplicate because of when/where it was written, and a withdrawn
  * conclusion can be re-written later.
  */
-export declare function computeDigest(title: string, summary: string, keywords: string[], content: string): string;
+export declare function computeDigest(title: string, summary: string, keywords: string[], content: string, kind?: "task" | "topic"): string;
 /** UTC millisecond timestamp for filenames: `20260823T113612.123Z`. */
 export declare function utcMs(date: Date): string;
 /** ISO date for a committer timestamp; falls back to the epoch for out-of-range values. */
@@ -205,18 +252,30 @@ export declare function createEntryFile(memDir: string, baseName: string, conten
 export declare function buildEntryMarkdown(input: ValidatedWriteInput, ctx: CodeContext & {
     relatedBranches: string[];
 }, digest: string, date: Date): string;
+/**
+ * Recency bonus for search scoring: +0.5 for entries at most 30 days old,
+ * linearly decaying to 0 at 180 days, 0 beyond. Bounded below one whole
+ * matched keyword, so freshness only reorders equal-match entries.
+ */
+export declare function recencyBonus(committerTime: number, nowMs?: number): number;
 /** ADD commit message (plan 4.1). */
-export declare function buildAddMessage(title: string, summary: string, keywords: string[], digest: string, legacy?: boolean): string;
+export declare function buildAddMessage(title: string, summary: string, keywords: string[], digest: string, legacy?: boolean, kind?: "task" | "topic"): string;
 /** DELETE commit message (plan 4.2). */
 export declare function buildDeleteMessage(entryName: string, reason: string, deletesHash: string): string;
 /** REPLACE commit message (plan 4.3). */
-export declare function buildReplaceMessage(title: string, summary: string, keywords: string[], digest: string, replacesHash: string): string;
+export declare function buildReplaceMessage(title: string, summary: string, keywords: string[], digest: string, replacesHash: string, kind?: "task" | "topic"): string;
 /**
  * Parse a commit message into logical search fields. The trailer block is the
  * contiguous run at the end; everything between subject and the block is the
  * summary. Malformed input degrades to `type: "unknown"` (legacy commits).
  */
 export declare function parseCommitMessage(raw: string): ParsedCommitMessage;
+/**
+ * Extract unique `[[<commit-hash>]]` wiki links from an entry body, in order
+ * of first appearance, capped at 32 per entry. Anything that is not a plain
+ * hex hash inside double brackets is ignored.
+ */
+export declare function extractEntryLinks(content: string): string[];
 /**
  * Parse the NUL-delimited log stream
  * (`--format=%x00%H%x00%ct%x00%s%x00%B%x00 --name-status --no-renames`).
@@ -299,9 +358,20 @@ export declare class GitMemo {
     /**
      * Read one memory entry by create/replace commit hash. Historical entries
      * (deleted or replaced) stay readable for audit; `mem_read` accepts legacy
-     * hashes too.
+     * hashes too. With `options.expand`, `[[<commit-hash>]]` links in the entry
+     * body are resolved one hop to their target entries (each target follows
+     * forward to the active version of its entry file).
      */
-    read(commitHash: string): Promise<ReadResult>;
+    read(commitHash: string, options?: ReadOptions): Promise<ReadResult>;
+    /**
+     * One-hop resolution of `[[<commit-hash>]]` links (caller must hold the
+     * operation lock). A link whose entry was later REPLACED is followed
+     * forward along the `GitMemo-Replaces` chain to the active version, so a
+     * topic page's links survive their targets being refreshed; withdrawn or
+     * dangling links come back with `active: false` (plus an `error` field
+     * when the link hash cannot be resolved at all).
+     */
+    private resolveEntryLinks;
     /**
      * Write a memory entry (plan 5.3). Entries are immutable: each write
      * creates a brand-new file `entries/<utc-ms>-<digest-prefix>-<slug>.md`

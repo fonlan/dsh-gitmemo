@@ -8,8 +8,8 @@
  *    ADD commit; corrections use `replace` (one commit deleting the old file
  *    and adding the new one), withdrawal uses `delete`.
  *  - Commit messages are structured: subject = title, body = summary, then a
- *    contiguous trailer block (`GitMemo-Type/Keyword/Digest/Deletes/Replaces/
- *    Search-Text/Legacy`). Search only reads commit messages via
+ *    contiguous trailer block (`GitMemo-Type/Kind/Keyword/Digest/Deletes/
+ *    Replaces/Search-Text/Legacy`). Search only reads commit messages via
  *    `git log --grep --fixed-strings`; entry bodies are never scanned.
  *  - All state transitions (init/write/delete/replace/migrate) run under a
  *    cross-process lock (sibling lock file + in-process mutex) with a short
@@ -63,6 +63,14 @@ export interface SearchHit {
   date: string;
   summary: string;
   keywords: string[];
+  /** Entry kind: `task` (task-outcome record) or `topic` (aggregated topic page). */
+  kind: "task" | "topic";
+  /**
+   * Relevance = distinct matched keywords + a mild recency bonus (at most
+   * +0.5, linearly decaying to 0 between 30 and 180 days of age). The bonus
+   * never outweighs an extra matched keyword, so it only reorders entries
+   * with equal match counts.
+   */
   score: number;
   matched_keywords: string[];
 }
@@ -96,6 +104,12 @@ export interface WriteInput {
   content: string;
   related_branches?: string[];
   related_paths?: string[];
+  /**
+   * Entry kind. `task` (default) is a task-outcome record; `topic` is an
+   * aggregated topic page (MOC) whose content links evidence entries via
+   * `[[<commit-hash>]]` and is evolved with mem_replace, not rewritten per task.
+   */
+  kind?: "task" | "topic";
 }
 
 /** One-version compatibility shape accepted by the engine, not model-facing tools. */
@@ -119,11 +133,43 @@ export interface WriteResult {
   legacy?: boolean;
 }
 
+/** Options for {@link GitMemo.read}. */
+export interface ReadOptions {
+  /**
+   * Resolve `[[<commit-hash>]]` links found in the entry content one hop to
+   * their target entries. Link targets automatically follow forward to the
+   * ACTIVE version of the linked entry file, so a topic page link survives
+   * its targets being replaced; the original link hash stays recorded.
+   */
+  expand?: boolean;
+}
+
+/** One-hop resolution of a `[[<commit-hash>]]` link inside an entry. */
+export interface LinkedEntryResolution {
+  /** Hash exactly as written inside the [[...]] link (lowercased). */
+  link_hash: string;
+  /** Hash actually read: the active version of the linked entry file ("" when unresolvable). */
+  resolved_hash: string;
+  /** True when the link hash still IS the active version (false = superseded or dangling). */
+  active: boolean;
+  file?: string;
+  title?: string;
+  summary?: string;
+  keywords?: string[];
+  kind?: "task" | "topic";
+  /** Present instead of title/summary when the link target cannot be resolved. */
+  error?: string;
+}
+
 export interface ReadResult {
   hash: string;
   file: string;
   content: string;
+  /** Entry kind parsed from the create/replace commit (legacy entries read as "task"). */
+  kind: "task" | "topic";
   legacy?: boolean;
+  /** Present only when the read was requested with `expand: true`. */
+  links?: LinkedEntryResolution[];
 }
 
 export interface DeleteInput {
@@ -141,6 +187,8 @@ export interface ParsedCommitMessage {
   summary: string;
   type: "add" | "replace" | "delete" | "unknown";
   keywords: string[];
+  /** Entry kind from the `GitMemo-Kind` trailer; absence means "task". */
+  kind: "task" | "topic";
   digest?: string;
   deletes?: string;
   replaces?: string;
@@ -395,6 +443,7 @@ export interface ValidatedWriteInput {
   content: string;
   related_branches: string[];
   related_paths: string[];
+  kind: "task" | "topic";
 }
 
 /**
@@ -483,7 +532,11 @@ export function validateWriteInput(input: WriteInput, legacy = false): Validated
     related_paths = dedupe(related_paths);
   }
 
-  return { title, summary, keywords, content, related_branches, related_paths };
+  if (input.kind !== undefined && input.kind !== "task" && input.kind !== "topic") {
+    throw new GitMemoError('gitmemo: kind must be "task" or "topic"');
+  }
+
+  return { title, summary, keywords, content, related_branches, related_paths, kind: input.kind ?? "task" };
 }
 
 async function adaptLegacyWriteInput(input: WriteInput | LegacyWriteInput): Promise<WriteInput> {
@@ -525,9 +578,15 @@ async function adaptLegacyWriteInput(input: WriteInput | LegacyWriteInput): Prom
  * an exact duplicate because of when/where it was written, and a withdrawn
  * conclusion can be re-written later.
  */
-export function computeDigest(title: string, summary: string, keywords: string[], content: string): string {
+export function computeDigest(
+  title: string,
+  summary: string,
+  keywords: string[],
+  content: string,
+  kind: "task" | "topic" = "task"
+): string {
   const normalizedKeywords = [...new Set(keywords.map((k) => normalizeKeyword(k)))].sort();
-  const payload = JSON.stringify({ title, summary, keywords: normalizedKeywords, content });
+  const payload = JSON.stringify({ title, summary, keywords: normalizedKeywords, content, kind });
   return createHash("sha256").update(payload, "utf8").digest("hex");
 }
 
@@ -650,6 +709,7 @@ export function buildEntryMarkdown(
     "---",
     "gitmemo_version: " + yamlJson(GITMEMO_FORMAT_VERSION),
     "date: " + yamlJson(date.toISOString()),
+    "kind: " + yamlJson(input.kind),
     "code_branch: " + yamlJson(ctx.branch),
     "code_commit: " + yamlJson(ctx.commit),
     "related_branches: " + yamlArray(ctx.relatedBranches),
@@ -675,15 +735,32 @@ function searchTexts(title: string, summary: string, keywords: string[]): string
   return [normalizeText(title), normalizeText(summary.replace(/\s+/g, " ")), ...keywords.map((k) => normalizeText(k))];
 }
 
+/**
+ * Recency bonus for search scoring: +0.5 for entries at most 30 days old,
+ * linearly decaying to 0 at 180 days, 0 beyond. Bounded below one whole
+ * matched keyword, so freshness only reorders equal-match entries.
+ */
+export function recencyBonus(committerTime: number, nowMs: number = Date.now()): number {
+  const ageDays = Math.max(0, (nowMs / 1000 - committerTime) / 86400);
+  if (ageDays <= 30) return 0.5;
+  if (ageDays >= 180) return 0;
+  return Math.round(((0.5 * (180 - ageDays)) / 150) * 100) / 100;
+}
+
+/** Commit trailer emitted only for topic pages (absence means "task"). */
+const KIND_TRAILER_TOPIC = "GitMemo-Kind: topic";
+
 /** ADD commit message (plan 4.1). */
 export function buildAddMessage(
   title: string,
   summary: string,
   keywords: string[],
   digest: string,
-  legacy = false
+  legacy = false,
+  kind: "task" | "topic" = "task"
 ): string {
   const lines = [title, "", summary, "", "GitMemo-Type: add"];
+  if (kind === "topic") lines.push(KIND_TRAILER_TOPIC);
   if (legacy) lines.push("GitMemo-Legacy: true");
   for (const kw of keywords) lines.push("GitMemo-Keyword: " + kw);
   lines.push("GitMemo-Digest: sha256:" + digest);
@@ -709,9 +786,11 @@ export function buildReplaceMessage(
   summary: string,
   keywords: string[],
   digest: string,
-  replacesHash: string
+  replacesHash: string,
+  kind: "task" | "topic" = "task"
 ): string {
   const lines = [title, "", summary, "", "GitMemo-Type: replace", "GitMemo-Replaces: " + replacesHash];
+  if (kind === "topic") lines.push(KIND_TRAILER_TOPIC);
   for (const kw of keywords) lines.push("GitMemo-Keyword: " + kw);
   lines.push("GitMemo-Digest: sha256:" + digest);
   for (const text of searchTexts(title, summary, keywords)) lines.push("GitMemo-Search-Text: " + text);
@@ -761,11 +840,30 @@ export function parseCommitMessage(raw: string): ParsedCommitMessage {
     summary,
     type,
     keywords: trailers.get("Keyword") ?? [],
+    kind: trailers.get("Kind")?.[0] === "topic" ? "topic" : "task",
     digest: trailers.get("Digest")?.[0]?.replace(/^sha256:/, "") || undefined,
     deletes: trailers.get("Deletes")?.[0] || undefined,
     replaces: trailers.get("Replaces")?.[0] || undefined,
     legacy: trailers.get("Legacy")?.[0] === "true"
   };
+}
+
+/**
+ * Extract unique `[[<commit-hash>]]` wiki links from an entry body, in order
+ * of first appearance, capped at 32 per entry. Anything that is not a plain
+ * hex hash inside double brackets is ignored.
+ */
+export function extractEntryLinks(content: string): string[] {
+  const links: string[] = [];
+  const seen = new Set<string>();
+  for (const match of content.matchAll(/\[\[([0-9a-fA-F]{7,64})\]\]/g)) {
+    const hash = match[1].toLowerCase();
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+    links.push(hash);
+    if (links.length >= 32) break;
+  }
+  return links;
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,6 +1757,7 @@ export class GitMemo {
     const hits: SearchHit[] = [];
     const diagnostics: string[] = [...(legacySnapshot?.diagnostics ?? [])];
     const seenFiles = new Set<string>();
+    const nowMs = Date.now();
     for (const record of candidates) {
       if (record.added.length !== 1) {
         if (record.added.length > 1) diagnostics.push(`commit ${record.hash} adds ${record.added.length} entries; skipped`);
@@ -1685,11 +1784,13 @@ export class GitMemo {
         date: safeIsoDate(record.committerTime),
         summary: record.message.summary,
         keywords: record.message.keywords,
-        score: matched.length,
+        kind: record.message.kind,
+        score: Math.round((matched.length + recencyBonus(record.committerTime, nowMs)) * 100) / 100,
         matched_keywords: matched
       });
     }
-    // plan 6.6: score desc, committer time desc, full hash desc (deterministic)
+    // plan 6.6: score desc (matches + mild recency bonus), committer time desc,
+    // full hash desc (deterministic)
     hits.sort(
       (a, b) => b.score - a.score || b.date.localeCompare(a.date) || (a.hash < b.hash ? 1 : a.hash > b.hash ? -1 : 0)
     );
@@ -1699,9 +1800,11 @@ export class GitMemo {
   /**
    * Read one memory entry by create/replace commit hash. Historical entries
    * (deleted or replaced) stay readable for audit; `mem_read` accepts legacy
-   * hashes too.
+   * hashes too. With `options.expand`, `[[<commit-hash>]]` links in the entry
+   * body are resolved one hop to their target entries (each target follows
+   * forward to the active version of its entry file).
    */
-  async read(commitHash: string): Promise<ReadResult> {
+  async read(commitHash: string, options: ReadOptions = {}): Promise<ReadResult> {
     if (!/^[0-9a-f]{7,64}$/.test(commitHash)) throw new GitMemoError("gitmemo: read requires a commit hash");
     return withLock(this.root, this.config, "read", async () => {
       if (!(await pathExists(join(this.memDir, ".git")))) {
@@ -1717,8 +1820,121 @@ export class GitMemo {
       const body = await git(this.memDir, ["log", "-1", "--format=%B", full], this.config.gitTimeoutMs);
       const message = parseCommitMessage(body);
       const legacy = message.type === "unknown";
-      return { hash: full, file: added[0], content, ...(legacy ? { legacy: true } : {}) };
+      const result: ReadResult = {
+        hash: full,
+        file: added[0],
+        content,
+        kind: message.kind,
+        ...(legacy ? { legacy: true as const } : {})
+      };
+      if (options.expand === true) {
+        result.links = await this.resolveEntryLinks(content);
+      }
+      return result;
     });
+  }
+
+  /**
+   * One-hop resolution of `[[<commit-hash>]]` links (caller must hold the
+   * operation lock). A link whose entry was later REPLACED is followed
+   * forward along the `GitMemo-Replaces` chain to the active version, so a
+   * topic page's links survive their targets being refreshed; withdrawn or
+   * dangling links come back with `active: false` (plus an `error` field
+   * when the link hash cannot be resolved at all).
+   */
+  private async resolveEntryLinks(content: string): Promise<LinkedEntryResolution[]> {
+    const linkHashes = extractEntryLinks(content);
+    if (linkHashes.length === 0) return [];
+    let snapshot = "";
+    try {
+      snapshot = (await git(this.memDir, ["rev-parse", "--verify", "refs/heads/main^{commit}"], this.config.gitTimeoutMs)).trim();
+    } catch {
+      try {
+        snapshot = (await git(this.memDir, ["rev-parse", "--verify", "HEAD^{commit}"], this.config.gitTimeoutMs)).trim();
+      } catch {
+        snapshot = "";
+      }
+    }
+    const resolutions: LinkedEntryResolution[] = [];
+    for (const link of linkHashes) {
+      try {
+        const full = await resolveCommit(this.memDir, link, this.config.gitTimeoutMs);
+        const added = await addedFilesOf(this.memDir, full, this.config.gitTimeoutMs);
+        if (added.length !== 1) {
+          resolutions.push({
+            link_hash: link,
+            resolved_hash: full,
+            active: false,
+            error: `commit ${link} maps to ${added.length} entry files — cannot resolve a single entry`
+          });
+          continue;
+        }
+        const activeHash = snapshot.length > 0
+          ? (await git(this.memDir, ["log", "-1", "--format=%H", snapshot, "--", added[0]], this.config.gitTimeoutMs)).trim()
+          : "";
+        let resolved = full;
+        let resolvedFile = added[0];
+        let isActive = activeHash === full;
+        if (!isActive) {
+          // The linked entry is not the active version of its file — either
+          // replaced (the last commit touching the old file is its replace
+          // commit, or the file is gone from the active tree entirely) or
+          // withdrawn. Follow the GitMemo-Replaces chain forward to the
+          // active successor; when there is none the chain ends at the link.
+          for (let hop = 0; hop < 16; hop += 1) {
+            const successorOut = await git(
+              this.memDir,
+              [
+                "log",
+                ...(snapshot.length > 0 ? [snapshot] : []),
+                "--fixed-strings",
+                "--grep=GitMemo-Replaces: " + resolved,
+                "--format=%H"
+              ],
+              this.config.gitTimeoutMs
+            ).catch(() => "");
+            const successors = successorOut.split("\n").map((h) => h.trim()).filter((h) => COMMIT_RE.test(h));
+            let next: { hash: string; file: string } | null = null;
+            for (const candidate of successors) {
+              const candidateFiles = await addedFilesOf(this.memDir, candidate, this.config.gitTimeoutMs);
+              if (candidateFiles.length !== 1) continue;
+              const candidateActive = snapshot.length > 0
+                ? (await git(this.memDir, ["log", "-1", "--format=%H", snapshot, "--", candidateFiles[0]], this.config.gitTimeoutMs)).trim()
+                : "";
+              if (candidateActive === candidate) {
+                next = { hash: candidate, file: candidateFiles[0] };
+                break;
+              }
+            }
+            if (next === null) break;
+            resolved = next.hash;
+            resolvedFile = next.file;
+            // isActive stays false: the LINK hash is not the active version —
+            // only resolved_hash carries it (the "superseded" case).
+          }
+        }
+        const body = await git(this.memDir, ["log", "-1", "--format=%B", resolved], this.config.gitTimeoutMs);
+        const message = parseCommitMessage(body);
+        resolutions.push({
+          link_hash: link,
+          resolved_hash: resolved,
+          active: isActive,
+          file: resolvedFile,
+          title: message.subject,
+          summary: message.summary,
+          keywords: message.keywords,
+          kind: message.kind
+        });
+      } catch (error) {
+        resolutions.push({
+          link_hash: link,
+          resolved_hash: "",
+          active: false,
+          error: String(error instanceof GitMemoError ? error.message : error).replace(/^gitmemo: /, "")
+        });
+      }
+    }
+    return resolutions;
   }
 
   /**
@@ -1730,7 +1946,7 @@ export class GitMemo {
   async write(input: WriteInput | LegacyWriteInput, legacy = false): Promise<WriteResult> {
     const adapted = legacy ? await adaptLegacyWriteInput(input) : input as WriteInput;
     const validated = validateWriteInput(adapted, legacy);
-    const digest = computeDigest(validated.title, validated.summary, validated.keywords, validated.content);
+    const digest = computeDigest(validated.title, validated.summary, validated.keywords, validated.content, validated.kind);
     return withLock(this.root, this.config, "write", async () => {
       await this.ensureWritable();
       await recoverJournal(this.memDir, this.config.gitTimeoutMs);
@@ -1771,7 +1987,7 @@ export class GitMemo {
         await assertStagedExactly(this.memDir, [{ status: "A", path: file }], this.config.gitTimeoutMs);
         const hash = await commitWithIdentity(
           this.memDir,
-          buildAddMessage(validated.title, validated.summary, validated.keywords, digest, legacy),
+          buildAddMessage(validated.title, validated.summary, validated.keywords, digest, legacy, validated.kind),
           this.config.gitTimeoutMs
         );
         await rm(journalPath(this.memDir), { force: true });
@@ -1847,8 +2063,6 @@ export class GitMemo {
    * legal; colliding with any OTHER active entry is rejected.
    */
   async replace(input: ReplaceInput): Promise<WriteResult> {
-    const validated = validateWriteInput(input);
-    const digest = computeDigest(validated.title, validated.summary, validated.keywords, validated.content);
     return withLock(this.root, this.config, "replace", async () => {
       await this.ensureWritable();
       await recoverJournal(this.memDir, this.config.gitTimeoutMs);
@@ -1857,7 +2071,11 @@ export class GitMemo {
       const ctx = await codeContext(this.root, this.config.gitTimeoutMs);
       const baseHead = (await git(this.memDir, ["rev-parse", "HEAD"], this.config.gitTimeoutMs)).trim();
       const full = await resolveCommit(this.memDir, input.commit_hash, this.config.gitTimeoutMs);
-      const { file: oldFile } = await activeEntryForHash(this.memDir, full, baseHead, this.config.gitTimeoutMs);
+      const { file: oldFile, message: oldMessage } = await activeEntryForHash(this.memDir, full, baseHead, this.config.gitTimeoutMs);
+      // kind inherits the replaced entry's kind unless explicitly overridden,
+      // so refreshing a topic page never silently demotes it to a task record.
+      const validated = validateWriteInput({ ...input, kind: input.kind ?? oldMessage.kind });
+      const digest = computeDigest(validated.title, validated.summary, validated.keywords, validated.content, validated.kind);
       const { active, records, claimed } = await activeSnapshot(this.memDir, baseHead, this.config.gitTimeoutMs);
       void active;
       for (const [file, entry] of claimed) {
@@ -1900,7 +2118,7 @@ export class GitMemo {
         );
         const hash = await commitWithIdentity(
           this.memDir,
-          buildReplaceMessage(validated.title, validated.summary, validated.keywords, digest, full),
+          buildReplaceMessage(validated.title, validated.summary, validated.keywords, digest, full, validated.kind),
           this.config.gitTimeoutMs
         );
         await rm(journalPath(this.memDir), { force: true });

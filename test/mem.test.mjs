@@ -213,6 +213,166 @@ test("write digest dedupe: active duplicates rejected; delete then re-write allo
   assert.notEqual(second.hash, first.hash);
 });
 
+test("topic pages: kind trailer + front matter, search kind field, replace inherits kind, digest separates kinds", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
+  const task = await memo.write({
+    title: "[auth] add login rate limit",
+    summary: "10 req/min",
+    keywords: ["auth", "限流"],
+    content: "body"
+  });
+  const topic = await memo.write({
+    title: "[topic] auth 机制现状",
+    summary: "登录限流已上线，当前阈值 10 req/min。",
+    keywords: ["auth", "现状", "current-state"],
+    content: "当前结论：登录限流 10 req/min。",
+    kind: "topic"
+  });
+
+  // task entries carry no kind trailer; topic entries do
+  const taskMessage = git(join(root, ".mem"), ["log", "-1", "--format=%B", task.hash]);
+  assert.ok(!taskMessage.includes("GitMemo-Kind"));
+  const topicMessage = git(join(root, ".mem"), ["log", "-1", "--format=%B", topic.hash]);
+  assert.match(topicMessage, /GitMemo-Kind: topic/);
+
+  // front matter + read round-trip
+  const topicEntry = await memo.read(topic.hash);
+  assert.match(topicEntry.content, /kind: "topic"/);
+  assert.equal(topicEntry.kind, "topic");
+  const taskEntry = await memo.read(task.hash);
+  assert.match(taskEntry.content, /kind: "task"/);
+  assert.equal(taskEntry.kind, "task");
+
+  // search hits carry kind
+  const found = await memo.search(["auth"]);
+  const byHash = Object.fromEntries(found.results.map((h) => [h.hash, h]));
+  assert.equal(byHash[topic.hash].kind, "topic");
+  assert.equal(byHash[task.hash].kind, "task");
+
+  // invalid kind rejected
+  await assert.rejects(
+    () => memo.write({ title: "[x] bad kind", summary: "s", keywords: ["a", "b"], content: "c", kind: "wiki" }),
+    /kind must be/
+  );
+
+  // replace inherits the replaced entry's topic kind when kind is omitted
+  const refreshed = await memo.replace({
+    commit_hash: topic.hash,
+    title: "[topic] auth 机制现状",
+    summary: "登录限流已上线，当前阈值 20 req/min。",
+    keywords: ["auth", "现状", "current-state"],
+    content: "当前结论：登录限流 20 req/min。"
+  });
+  const refreshedMessage = git(join(root, ".mem"), ["log", "-1", "--format=%B", refreshed.hash]);
+  assert.match(refreshedMessage, /GitMemo-Kind: topic/);
+  assert.equal((await memo.read(refreshed.hash)).kind, "topic");
+
+  // explicit kind overrides (topic → task conversion)
+  const demoted = await memo.replace({
+    commit_hash: refreshed.hash,
+    title: "[topic] auth 机制现状",
+    summary: "已降级为普通记录。",
+    keywords: ["auth", "现状"],
+    content: "转换。",
+    kind: "task"
+  });
+  assert.equal((await memo.read(demoted.hash)).kind, "task");
+  assert.ok(!git(join(root, ".mem"), ["log", "-1", "--format=%B", demoted.hash]).includes("GitMemo-Kind"));
+
+  // identical payload with a different kind is NOT a digest duplicate
+  const payload = { title: "[k] dual", summary: "same", keywords: ["kind", "test"], content: "same body" };
+  await memo.write(payload);
+  await assert.rejects(() => memo.write(payload), /same digest already exists/);
+  const topicTwin = await memo.write({ ...payload, kind: "topic" });
+  assert.match(topicTwin.hash, /^[0-9a-f]{40}$/);
+});
+
+test("wiki links: mem_read expand resolves [[hash]] one hop, follows replacements, reports dangling links", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
+  const a = await memo.write({
+    title: "[auth] add login rate limit",
+    summary: "10 req/min",
+    keywords: ["auth", "限流"],
+    content: "evidence A"
+  });
+  const b = await memo.write({
+    title: "[auth] add jwt rotation",
+    summary: "7 days",
+    keywords: ["auth", "jwt"],
+    content: "evidence B"
+  });
+  const dangling = "0".repeat(40);
+  const topic = await memo.write({
+    title: "[topic] auth 现状",
+    summary: "聚合页。",
+    keywords: ["auth", "现状"],
+    content: "证据：[[" + a.hash + "]] [[" + b.hash + "]]，另见 [[" + dangling + "]]。",
+    kind: "topic"
+  });
+
+  // without expand there is no links field
+  const plain = await memo.read(topic.hash);
+  assert.equal(Object.hasOwn(plain, "links"), false);
+  assertLosslessJson(plain);
+
+  // expand resolves both evidence links and reports the dangling one
+  const expanded = await memo.read(topic.hash, { expand: true });
+  assert.equal(expanded.links.length, 3);
+  const byLink = Object.fromEntries(expanded.links.map((l) => [l.link_hash, l]));
+  assert.equal(byLink[a.hash].active, true);
+  assert.equal(byLink[a.hash].resolved_hash, a.hash);
+  assert.equal(byLink[a.hash].title, "[auth] add login rate limit");
+  assert.equal(byLink[a.hash].kind, "task");
+  assert.ok(byLink[a.hash].summary.includes("10 req/min"));
+  assert.equal(byLink[b.hash].active, true);
+  assert.match(byLink[dangling].error, /no such commit/);
+  assert.equal(byLink[dangling].active, false);
+  assertLosslessJson(expanded);
+
+  // a link follows a replaced target forward to the new active version
+  const b2 = await memo.replace({
+    commit_hash: b.hash,
+    title: "[auth] add jwt rotation revised",
+    summary: "14 days",
+    keywords: ["auth", "jwt", "rotation"],
+    content: "evidence B v2"
+  });
+  const expanded2 = await memo.read(topic.hash, { expand: true });
+  const byLink2 = Object.fromEntries(expanded2.links.map((l) => [l.link_hash, l]));
+  assert.equal(byLink2[b.hash].active, false);
+  assert.equal(byLink2[b.hash].resolved_hash, b2.hash);
+  assert.equal(byLink2[b.hash].title, "[auth] add jwt rotation revised");
+  assert.notEqual(byLink2[b.hash].file, b.file); // replacement creates a new entry file
+  assert.equal(expanded2.links.find((l) => l.link_hash === a.hash).active, true);
+
+  // a withdrawn link resolves to the historical version, flagged not active
+  await memo.delete({ commit_hash: a.hash, reason: "withdrawn" });
+  const expanded3 = await memo.read(topic.hash, { expand: true });
+  const aLink3 = expanded3.links.find((l) => l.link_hash === a.hash);
+  assert.equal(aLink3.active, false);
+  assert.equal(aLink3.resolved_hash, a.hash);
+  assert.equal(aLink3.title, "[auth] add login rate limit");
+
+  // abbreviated hashes are valid link targets
+  const short = await memo.write({
+    title: "[topic] short links",
+    summary: "s",
+    keywords: ["short", "links"],
+    content: "[[" + a.hash.slice(0, 8) + "]]"
+  });
+  const expandedShort = await memo.read(short.hash, { expand: true });
+  assert.equal(expandedShort.links.length, 1);
+  assert.equal(expandedShort.links[0].link_hash, a.hash.slice(0, 8));
+  assert.equal(expandedShort.links[0].resolved_hash, a.hash);
+  assert.equal(expandedShort.links[0].active, false); // withdrawn above
+
+  // entries without links expand to an empty list
+  const noLinks = await memo.read(b2.hash, { expand: true });
+  assert.deepEqual(noLinks.links, []);
+});
+
 // ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------
@@ -252,13 +412,13 @@ test("search: OR recall over title/summary/keywords only; body-only words never 
   const multi = await memo.search(["auth", "database"]);
   assert.equal(multi.results.length, 2);
   const byHash = Object.fromEntries(multi.results.map((h) => [h.hash, h]));
-  assert.equal(byHash[a.hash].score, 1);
+  assert.equal(byHash[a.hash].score, 1.5); // 1 matched keyword + 0.5 recency bonus (fresh entry)
   assert.deepEqual(byHash[a.hash].matched_keywords, ["auth"]);
   assert.deepEqual(byHash[b.hash].matched_keywords, ["database"]);
   const multi2 = await memo.search(["auth", "登录", "限流"]);
   assert.equal(multi2.results.length, 1);
   assert.equal(multi2.results[0].hash, a.hash);
-  assert.equal(multi2.results[0].score, 3);
+  assert.equal(multi2.results[0].score, 3.5); // 3 matched keywords + 0.5 recency bonus
   assert.deepEqual([...multi2.results[0].matched_keywords].sort(), ["auth", "登录", "限流"]);
   assert.deepEqual(multi2.results[0].keywords, ["auth", "rate-limit", "登录", "限流"]);
 });
@@ -304,10 +464,48 @@ test("search validates and deduplicates normalized query keywords", async () => 
   const found = await memo.search(["Auth", "ＡＵＴＨ", "auth"]);
   assert.equal(found.results.length, 1);
   assert.equal(found.results[0].hash, entry.hash);
-  assert.equal(found.results[0].score, 1);
+  assert.equal(found.results[0].score, 1.5);
   assert.deepEqual(found.results[0].matched_keywords, ["auth"]);
   await assert.rejects(() => memo.search(["x".repeat(65)]), /at most 64/);
   await assert.rejects(() => memo.search(["bad\nquery"]), /single line/);
+});
+
+test("search recency: fresh entry outranks an equally-matched old entry; bonus stays under one keyword", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
+  // an entry committed ~300 days ago (beyond the 180-day recency window)
+  const oldDate = new Date(Date.now() - 300 * 86400 * 1000).toISOString().replace(/\.\d{3}Z$/, "+00:00");
+  process.env.GIT_COMMITTER_DATE = oldDate;
+  process.env.GIT_AUTHOR_DATE = oldDate;
+  const oldEntry = await memo.write({
+    title: "[cache] redis decision",
+    summary: "single redis",
+    keywords: ["cache", "决策"],
+    content: "old conclusion"
+  });
+  delete process.env.GIT_COMMITTER_DATE;
+  delete process.env.GIT_AUTHOR_DATE;
+  const fresh = await memo.write({
+    title: "[cache] redis decision revised",
+    summary: "redis cluster",
+    keywords: ["cache", "决策"],
+    content: "new conclusion"
+  });
+  const found = await memo.search(["cache"]);
+  assert.equal(found.results.length, 2);
+  // same matched count (1) — recency decides
+  assert.equal(found.results[0].hash, fresh.hash);
+  assert.equal(found.results[0].score, 1.5);
+  assert.equal(found.results[1].hash, oldEntry.hash);
+  assert.equal(found.results[1].score, 1);
+  // match count dominates: 1 matched keyword on the fresh entry (+0.5) can
+  // never beat 2 matched keywords on the old entry (+0)
+  const multi = await memo.search(["cache", "决策"]);
+  const byHash = Object.fromEntries(multi.results.map((h) => [h.hash, h]));
+  assert.equal(byHash[oldEntry.hash].score, 2);
+  assert.equal(byHash[fresh.hash].score, 2.5);
+  const singleOld = await memo.search(["决策"]);
+  assert.deepEqual(singleOld.results.map((h) => h.hash), [fresh.hash, oldEntry.hash]); // freshness tiebreak
 });
 
 test("engine rejects non-positive non-integer search limits", async () => {
@@ -1377,6 +1575,73 @@ test("plugin tools work end-to-end with the new contracts and legacy adapter", a
   const s3 = await search.execute({ keywords: ["tool"] }, exec);
   const replacedHit = s3.results.find((h) => h.hash === r.hash);
   assert.ok(replacedHit);
+});
+
+test("plugin: topic kind flows through mem_write/mem_replace and mem_read expand resolves links", async () => {
+  const mod = await import("../lib/index.js");
+  const toolRoot = makeNonGitDir();
+  const registrations = [];
+  const eventHandlers = {};
+  await mod.apply(
+    { on: (event, handler) => { eventHandlers[event] = handler; }, logger: { warn: () => {} } },
+    { searchLimit: 20 }
+  );
+  const agentCtx = { tools: { register: (t) => registrations.push(t) }, systemPrompt: { section: () => {} } };
+  eventHandlers["agent/created"]({ agent: { id: "a2", session: { header: { cwd: toolRoot, delegationDepth: 0 } }, ctx: agentCtx } });
+  const byName = Object.fromEntries(registrations.map((t) => [t.name, t]));
+  const exec = { agent: { session: { header: { cwd: toolRoot } } } };
+
+  // schema surface: mem_write/mem_replace expose kind, mem_read exposes expand
+  assert.ok(byName.mem_write.parameters.properties.kind);
+  assert.ok(byName.mem_replace.parameters.properties.kind);
+  assert.ok(byName.mem_read.parameters.properties.expand);
+
+  const write = byName.mem_write;
+  const evidence = await write.execute({
+    title: "[auth] add login rate limit",
+    summary: "10 req/min",
+    keywords: ["auth", "限流"],
+    content: "body"
+  }, exec);
+  const topic = await write.execute({
+    title: "[topic] auth 现状",
+    summary: "聚合页。",
+    keywords: ["auth", "现状"],
+    content: "证据：[[" + evidence.hash + "]]",
+    kind: "topic"
+  }, exec);
+  assertLosslessJson(topic);
+
+  const read = byName.mem_read;
+  const expanded = await read.execute({ commit_hash: topic.hash, expand: true }, exec);
+  assert.equal(expanded.kind, "topic");
+  assert.equal(expanded.links.length, 1);
+  assert.equal(expanded.links[0].link_hash, evidence.hash);
+  assert.equal(expanded.links[0].active, true);
+  assert.equal(expanded.links[0].title, "[auth] add login rate limit");
+  assertLosslessJson(expanded);
+  const plain = await read.execute({ commit_hash: topic.hash }, exec);
+  assert.equal(Object.hasOwn(plain, "links"), false);
+
+  // search hits carry kind
+  const search = byName.mem_search;
+  const hits = await search.execute({ keywords: ["auth"] }, exec);
+  const byHash = Object.fromEntries(hits.results.map((h) => [h.hash, h]));
+  assert.equal(byHash[topic.hash].kind, "topic");
+  assert.equal(byHash[evidence.hash].kind, "task");
+
+  // replace through the tool inherits the topic kind
+  const replace = byName.mem_replace;
+  const refreshed = await replace.execute({
+    commit_hash: topic.hash,
+    title: "[topic] auth 现状 v2",
+    summary: "阈值调整。",
+    keywords: ["auth", "现状"],
+    content: "证据：[[" + evidence.hash + "]]"
+  }, exec);
+  const refreshedRead = await read.execute({ commit_hash: refreshed.hash, expand: true }, exec);
+  assert.equal(refreshedRead.kind, "topic");
+  assert.equal(refreshedRead.links[0].resolved_hash, evidence.hash);
 });
 
 test("normalization contract: NFKC + case folding + whitespace collapse", () => {
