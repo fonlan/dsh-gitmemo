@@ -23,6 +23,7 @@
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { GitMemo, GitMemoError, resolveProjectRoot, type GitMemoConfig, type SearchOutput } from "./mem.js";
+import { evaluateGate, type GateCandidate, type GateDecision, type GateOptions, type SystemOneMode } from "./systemone.js";
 
 /** Cordis plugin name. */
 const name = "dsh-gitmemo";
@@ -43,13 +44,206 @@ const Config = z.object({
   /** Cross-process lock wait timeout in milliseconds. Default 30000. */
   lockTimeoutMs: z.number().default(30000),
   /** Optional explicit project root; defaults to the calling session's cwd. */
-  projectRoot: z.string()
+  projectRoot: z.string(),
+  /**
+   * Optional System-one recall gate. When an endpoint and a credential are
+   * configured, each `mem_search` page is narrowed by a System-one model
+   * (TypeSafe Jev by default) before it reaches the model; when nothing is
+   * configured the gate is a no-op and recall behaves exactly as before.
+   *
+   * `.volatile()` is REQUIRED here, not cosmetic: the settings plane only
+   * exposes a field that sits on or under a volatile node (`volatileForm()`
+   * returns undefined otherwise, and `describe()` then skips this entry
+   * entirely while `write()` throws). Verified against
+   * `@deepseek-ai/dsh-settings`. Note that DSH 0.1.7-alpha.1 ships no client
+   * that auto-generates a page from the schema, so this plugin also ships its
+   * own settings card (see `src/client/`).
+   */
+  systemOne: z.object({
+    /** Master switch. Defaults to true; with no credential the gate stays a no-op. */
+    enabled: z.boolean().default(true).volatile(),
+    /** Endpoint accepting the System-one request contract. */
+    endpoint: z.string().default("https://api.typesafe.ai/v1/systemone").volatile(),
+    /** Model identifier sent in the request body. */
+    model: z.string().default("jev-latest").volatile(),
+    /** Literal API key. Declared secret: redacted on every read, write-only in the form. */
+    apiKey: z.string().role("secret").volatile(),
+    /** Credential reference resolved through the credentials service, then the environment. */
+    apiKeyEnv: z.string().role("credential-ref").default("TYPESAFE_API_KEY").volatile(),
+    /** Question type used to judge each candidate. */
+    mode: z.union(["noul", "score"]).default("noul").volatile(),
+    /** noul mode: keep a candidate when its probability is at least this value. */
+    threshold: z.number().min(0).max(1).default(0.5).volatile(),
+    /** score mode: keep a candidate when its score is at least this value.
+     * Jev's `score` is Σ(level_index × probability) over 0…levels−1, NOT 0–1;
+     * with the default 5 levels the range is 0…4, where 2 = "partially relevant". */
+    scoreMin: z.number().default(2).volatile(),
+    /** Retain at least this many candidates when the model rejects an entire page. */
+    minKeep: z.number().step(1).min(0).default(1).volatile(),
+    /** Never judge more than this many candidates per request. */
+    maxCandidates: z.number().step(1).min(1).default(20).volatile(),
+    /** Truncate the task text to this many characters before sending it. */
+    maxTaskChars: z.number().step(1).min(1).default(2000).volatile(),
+    /** End-to-end request deadline in milliseconds. */
+    timeoutMs: z.number().step(1).min(1).default(8000).volatile()
+  })
 });
+
+/** Resolved System-one settings for one search. */
+interface SystemOneConfig {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  mode: SystemOneMode;
+  threshold: number;
+  scoreMin: number;
+  minKeep: number;
+  maxCandidates: number;
+  maxTaskChars: number;
+  timeoutMs: number;
+  apiKey?: string;
+  apiKeyEnv: string;
+}
 
 interface ResolvedConfig {
   searchLimit: number;
   lockTimeoutMs: number;
   projectRoot?: string;
+  /**
+   * Builds the gate settings for one search, or resolves to undefined when the
+   * gate is switched off or no credential is available — in which case recall
+   * behaves exactly as it did before the gate existed.
+   */
+  gateFor?: () => Promise<GateOptions | undefined>;
+  /** Best-effort sink for per-candidate verdicts (kept out of the model context). */
+  log?: (message: string) => void;
+}
+
+/** Machine-visible summary of one gate decision, attached to the search output. */
+interface GatedSearchOutput extends SearchOutput {
+  gated?: {
+    mode: SystemOneMode;
+    model: string;
+    /** Size of the candidate page the gate was handed. */
+    candidates: number;
+    /** Candidates actually sent to the endpoint (≤ `maxCandidates`). */
+    judged: number;
+    /** Candidates past `maxCandidates`: never evaluated, never dropped. */
+    untouched: number;
+    kept: number;
+    dropped: number;
+    degraded: boolean;
+    /** Set when the gate degraded, or when it floored a wholly-rejected page. */
+    reason?: string;
+    /** Input tokens the endpoint billed for the gate request. */
+    input_tokens?: number;
+    /** 8-char hashes of dropped candidates, so a wrongly-dropped memory stays recoverable. */
+    dropped_hashes: string[];
+  };
+}
+
+/**
+ * Read a config node that may be a plain value or a live (`.volatile()`) node.
+ *
+ * A plugin whose Config declares volatile fields receives a reactive config
+ * whose fields expose `get()`, while hand-written config objects and tests pass
+ * plain values. Both shapes are supported here so the same code path serves the
+ * settings page, `cordis.patch.yml`, and the unit tests.
+ */
+function liveValue<T>(node: unknown, fallback: T): T {
+  if (node === undefined || node === null) return fallback;
+  const getter = (node as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    const value = (getter as () => unknown).call(node);
+    return value === undefined ? fallback : (value as T);
+  }
+  return node as T;
+}
+
+/** Read the live `systemOne` section in whichever shape the loader supplied. */
+function systemOneSection(config: unknown): Record<string, unknown> {
+  const section = liveValue<unknown>((config as { systemOne?: unknown } | undefined)?.systemOne, undefined);
+  return (section ?? {}) as Record<string, unknown>;
+}
+
+/** Project a (possibly reactive) `systemOne` section into plain settings. */
+function readSystemOne(config: unknown): SystemOneConfig {
+  const section = systemOneSection(config);
+  const mode = liveValue<string>(section.mode, "noul");
+  return {
+    enabled: liveValue<boolean>(section.enabled, true),
+    endpoint: liveValue<string>(section.endpoint, "https://api.typesafe.ai/v1/systemone"),
+    model: liveValue<string>(section.model, "jev-latest"),
+    mode: mode === "score" ? "score" : "noul",
+    threshold: liveValue<number>(section.threshold, 0.5),
+    scoreMin: liveValue<number>(section.scoreMin, 2),
+    minKeep: liveValue<number>(section.minKeep, 1),
+    maxCandidates: liveValue<number>(section.maxCandidates, 20),
+    maxTaskChars: liveValue<number>(section.maxTaskChars, 2000),
+    timeoutMs: liveValue<number>(section.timeoutMs, 8000),
+    apiKey: liveValue<string | undefined>(section.apiKey, undefined),
+    apiKeyEnv: liveValue<string>(section.apiKeyEnv, "TYPESAFE_API_KEY")
+  };
+}
+
+/**
+ * Resolve the API key for the configured credential reference: a literal key
+ * from the settings page wins, then the harness credentials service, then the
+ * launching environment. Mirrors the shipped web-search provider's order.
+ */
+async function resolveApiKey(hostCtx: unknown, section: SystemOneConfig): Promise<string | undefined> {
+  if (typeof section.apiKey === "string" && section.apiKey.length > 0) return section.apiKey;
+  const ref = section.apiKeyEnv;
+  if (typeof ref !== "string" || ref.length === 0) return undefined;
+  try {
+    const get = (hostCtx as { get?: (name: string) => unknown } | undefined)?.get;
+    const credentials = typeof get === "function" ? get.call(hostCtx, "credentials") : undefined;
+    const resolve = (credentials as { resolve?: (ref: string) => Promise<{ value?: string } | undefined> } | undefined)?.resolve;
+    if (typeof resolve === "function") {
+      const resolved = await resolve.call(credentials, ref);
+      if (resolved?.value !== undefined && resolved.value.length > 0) return resolved.value;
+    }
+  } catch {
+    // Credentials are optional: fall through to the environment.
+  }
+  const ambient = process.env[ref];
+  return ambient !== undefined && ambient.length > 0 ? ambient : undefined;
+}
+
+/** One text part's worth of content, whatever shape the message carries. */
+function messageText(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = content
+    .filter((part) => (part as { type?: string })?.type === "text")
+    .map((part) => (part as { text?: unknown }).text)
+    .filter((text): text is string => typeof text === "string");
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+/**
+ * The agent's current task: the most recent user message in the derived
+ * history. Without it the gate would judge candidates against bare keywords,
+ * which is exactly the weak signal the gate is meant to compensate for.
+ */
+function currentTask(exec: unknown): string | undefined {
+  const session = (exec as { agent?: { session?: { deriveMessages?: () => unknown } } } | undefined)?.agent?.session;
+  const derive = session?.deriveMessages;
+  if (typeof derive !== "function") return undefined;
+  let messages: unknown;
+  try {
+    messages = derive.call(session);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(messages)) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index] as { role?: string; content?: unknown } | undefined;
+    if (message?.role !== "user") continue;
+    const text = messageText(message.content);
+    if (text !== undefined && text.trim().length > 0) return text.trim();
+  }
+  return undefined;
 }
 
 /** The calling agent's session workspace, when it has one. */
@@ -148,7 +342,7 @@ function textBlock(text: string) {
   return [{ type: "text" as const, text }];
 }
 
-function formatSearchResults(value: SearchOutput): string {
+function formatSearchResults(value: GatedSearchOutput): string {
   const lines = [
     `snapshot=${value.snapshot} total=${value.total} next_skip=${value.next_skip ?? "null"}` +
       (value.legacy === true ? " legacy=true" : "")
@@ -170,6 +364,37 @@ function formatSearchResults(value: SearchOutput): string {
     if (hit.summary.length > 0) lines.push("  summary: " + hit.summary.replace(/\s+/g, " ").slice(0, 300));
   }
   if (value.results.length === 0) lines.push("(no matching memories)");
+  if (value.gated !== undefined) {
+    lines.push(
+      "gated: mode=" +
+        value.gated.mode +
+        " model=" +
+        value.gated.model +
+        " judged=" +
+        value.gated.judged +
+        // Only surfaced when the page exceeded maxCandidates, so the default
+        // line stays byte-identical to before this field existed.
+        (value.gated.untouched > 0 ? " untouched=" + value.gated.untouched : "") +
+        " kept=" +
+        value.gated.kept +
+        " dropped=" +
+        value.gated.dropped +
+        // A degraded gate explains itself; a floor (every candidate rejected,
+        // minKeep applied) must be just as visible — otherwise `kept=1` reads
+        // as "one candidate genuinely passed".
+        (value.gated.degraded
+          ? " DEGRADED(" + (value.gated.reason ?? "unknown") + ")"
+          : value.gated.reason === undefined
+            ? ""
+            : " NOTE(" + value.gated.reason + ")")
+    );
+    if (value.gated.dropped_hashes.length > 0) {
+      lines.push(
+        "  dropped by the gate (mem_read one of these short hashes to recover it): " +
+          value.gated.dropped_hashes.join(",")
+      );
+    }
+  }
   if (value.warning !== undefined) lines.push("warning: " + value.warning);
   for (const diagnostic of value.diagnostics ?? []) lines.push("diagnostic: " + diagnostic);
   return lines.join("\n");
@@ -180,7 +405,7 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
   ctx.tools.register(defineTool({
     name: "mem_search",
     description:
-      "Search the gitmemo long-term memory (.mem git repo) for past task outcomes. Call BEFORE starting repo-related work: extract 1-12 中英文关键词 from the user request (include synonyms in both languages when useful) and run mem_search; pure chat and general Q&A need no search. Returns a snapshot, total, next_skip and up to 20 scored hits with summary/keywords/kind/matched_keywords — score = distinct matched keywords + a mild recency bonus, so newer entries rank slightly higher and superseded conclusions lose to their replacements. Select at most 5 most relevant hits and mem_read them (prefer kind:\"topic\" hits as topic-page entry points). Paginate by passing skip and the returned snapshot back unchanged; a stale snapshot is rejected explicitly.",
+      "Search the gitmemo long-term memory (.mem git repo) for past task outcomes. Call BEFORE starting repo-related work: extract 1-12 中英文关键词 from the user request (include synonyms in both languages when useful) and run mem_search; pure chat and general Q&A need no search. Returns a snapshot, total, next_skip and up to 20 scored hits with summary/keywords/kind/matched_keywords — score = distinct matched keywords + a mild recency bonus, so newer entries rank slightly higher and superseded conclusions lose to their replacements. Select at most 5 most relevant hits and mem_read them (prefer kind:\"topic\" hits as topic-page entry points). Paginate by passing skip and the returned snapshot back unchanged; a stale snapshot is rejected explicitly. An optional System-one gate may narrow the page: when the output carries a `gated` block, the entries it removed are listed as 8-char `dropped_hashes` — mem_read one of those if you suspect a relevant memory was filtered out (they stay fully readable). A `NOTE(...)` on the `gated` line means every candidate was judged irrelevant and only a `minKeep` floor was retained, not that one candidate passed.",
     parameters: {
       keywords: { ...KEYWORDS_ARRAY, required: true },
       skip: {
@@ -211,19 +436,130 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
             type: "array",
             items: { type: "string" },
             description: "Malformed commit/file mappings skipped during search."
+          },
+          gated: {
+            type: "object",
+            additionalProperties: false,
+            description:
+              "Present only when the System-one recall gate ran: how many candidates it judged (and how many past the cap it left untouched), how many it kept, the short hashes it dropped, and whether it had to fail open.",
+            properties: {
+              mode: { type: "string", required: true, description: "Question type used: noul or score." },
+              model: { type: "string", required: true, description: "System-one model the request named." },
+              candidates: { type: "number", required: true, description: "Size of the candidate page the gate was handed." },
+              judged: {
+                type: "number",
+                required: true,
+                description: "Candidates actually sent to the endpoint, i.e. min(maxCandidates, candidates)."
+              },
+              untouched: {
+                type: "number",
+                required: true,
+                description:
+                  "Candidates past maxCandidates: never evaluated, therefore never dropped. Non-zero only on a page larger than the cap."
+              },
+              kept: { type: "number", required: true, description: "Candidates the gate retained." },
+              dropped: { type: "number", required: true, description: "Candidates the gate removed." },
+              degraded: {
+                type: "boolean",
+                required: true,
+                description: "True when the gate failed open (endpoint/parse failure); every candidate was kept."
+              },
+              reason: {
+                type: "string",
+                description:
+                  "Why the gate degraded, or that it floored a wholly-rejected page (no candidate cleared the threshold, so minKeep were retained)."
+              },
+              input_tokens: {
+                type: "number",
+                description: "Input tokens the endpoint billed for the gate request (output tokens are free)."
+              },
+              dropped_hashes: {
+                type: "array",
+                required: true,
+                items: { type: "string" },
+                description:
+                  "8-char hashes of dropped candidates. Pass one to mem_read to recover a memory the gate judged irrelevant."
+              }
+            }
           }
         }
       },
-      render: (_args: unknown, value: SearchOutput) => textBlock(formatSearchResults(value))
+      render: (_args: unknown, value: GatedSearchOutput) => textBlock(formatSearchResults(value))
     },
     isConcurrencySafe: () => true,
-    async execute(args: { keywords: string[] | string; skip?: number; snapshot?: string; mode?: string }, exec: unknown) {
+    async execute(
+      args: { keywords: string[] | string; skip?: number; snapshot?: string; mode?: string },
+      exec: unknown
+    ): Promise<SearchOutput | GatedSearchOutput> {
       const memo = await engineFor(exec, config);
-      return await memo.search(args.keywords, {
+      const result = await memo.search(args.keywords, {
         skip: args.skip ?? 0,
         snapshot: args.snapshot,
         mode: (args.mode as "and" | "or" | "auto" | undefined)
       });
+
+      // System-one recall gate: purely subtractive, and only ever reached when
+      // an endpoint credential is configured. No credential => this returns the
+      // untouched engine result, so recall behaves exactly as it did before.
+      if (config.gateFor === undefined || result.results.length === 0) return result;
+      const options = await config.gateFor();
+      if (options === undefined) return result;
+
+      const task =
+        currentTask(exec) ??
+        (Array.isArray(args.keywords) ? args.keywords.join(" ") : String(args.keywords));
+      const candidates: GateCandidate[] = result.results.map((hit) => ({
+        hash: hit.hash,
+        title: hit.title,
+        summary: hit.summary,
+        keywords: hit.keywords,
+        kind: hit.kind
+      }));
+      const decision: GateDecision = await evaluateGate(
+        task,
+        candidates,
+        options,
+        (exec as { signal?: AbortSignal } | undefined)?.signal
+      );
+
+      // Per-candidate values go to the log (for threshold tuning) rather than
+      // into the model context, which is the very thing the gate is shrinking.
+      config.log?.(
+        "mem_search gate" +
+          (decision.degraded ? " DEGRADED" : "") +
+          " mode=" + decision.mode +
+          " model=" + decision.model +
+          " candidates=" + candidates.length +
+          " judged=" + decision.judged +
+          (decision.untouched === 0 ? "" : " untouched=" + decision.untouched) +
+          " kept=" + decision.kept.length +
+          " dropped=" + decision.dropped.length +
+          (decision.reason === undefined ? "" : " reason=" + decision.reason) +
+          (decision.usage?.inputTokens === undefined ? "" : " input_tokens=" + decision.usage.inputTokens) +
+          " verdicts=" +
+          decision.verdicts
+            .map((verdict) => verdict.hash.slice(0, 8) + ":" + (verdict.value ?? "na") + ":" + (verdict.keep ? "keep" : "drop"))
+            .join(",")
+      );
+
+      const kept = new Set(decision.kept);
+      return {
+        ...result,
+        results: result.results.filter((hit) => kept.has(hit.hash)),
+        gated: {
+          mode: decision.mode,
+          model: decision.model,
+          candidates: candidates.length,
+          judged: decision.judged,
+          untouched: decision.untouched,
+          kept: decision.kept.length,
+          dropped: decision.dropped.length,
+          degraded: decision.degraded,
+          ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+          ...(decision.usage?.inputTokens === undefined ? {} : { input_tokens: decision.usage.inputTokens }),
+          dropped_hashes: decision.dropped.map((hash) => hash.slice(0, 8))
+        }
+      };
     },
     presentCall: (args: { keywords: string[] | string }) => ({
       card: "generic",
@@ -574,7 +910,9 @@ interface CreatedAgent {
 async function apply(
   ctx: {
     on(event: string, handler: (payload: { agent: CreatedAgent }) => void): unknown;
-    logger: { warn(message: string): void };
+    logger: { warn(message: string): void; info?(message: string): void };
+    /** Optional service accessor (credentials); absent in hand-built test contexts. */
+    get?(name: string): unknown;
   },
   config: Partial<{
     memDirName?: string;
@@ -583,12 +921,42 @@ async function apply(
     recentContextLimit?: number;
     lockTimeoutMs?: number;
     projectRoot?: string;
+    /** System-one gate section; a live (`.volatile()`) node in the real loader. */
+    systemOne?: unknown;
   }> = {}
 ): Promise<void> {
+  const log = (message: string): void => {
+    if (typeof ctx.logger.info === "function") ctx.logger.info(message);
+  };
   const resolved: ResolvedConfig = {
     searchLimit: config.searchLimit ?? 20,
     lockTimeoutMs: config.lockTimeoutMs ?? 30000,
-    projectRoot: config.projectRoot
+    projectRoot: config.projectRoot,
+    log,
+    /**
+     * Resolved per search so settings-page edits take effect immediately.
+     * Returns undefined — leaving recall byte-for-byte unchanged — whenever the
+     * gate is switched off or has no usable credential.
+     */
+    gateFor: async () => {
+      const section = readSystemOne(config);
+      if (!section.enabled) return undefined;
+      if (typeof section.endpoint !== "string" || section.endpoint.length === 0) return undefined;
+      const apiKey = await resolveApiKey(ctx, section);
+      if (apiKey === undefined) return undefined;
+      return {
+        endpoint: section.endpoint,
+        model: section.model,
+        mode: section.mode,
+        threshold: section.threshold,
+        scoreMin: section.scoreMin,
+        minKeep: section.minKeep,
+        maxCandidates: section.maxCandidates,
+        maxTaskChars: section.maxTaskChars,
+        timeoutMs: section.timeoutMs,
+        apiKey
+      };
+    }
   };
   if (config.branchAlign !== undefined && config.branchAlign !== true) {
     ctx.logger.warn("dsh-gitmemo: `branchAlign` is deprecated and has no effect — .mem always stays on main");

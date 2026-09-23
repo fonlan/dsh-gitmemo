@@ -63,7 +63,70 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
     searchLimit: 20        # 每次 mem_search 返回的最大条数（每页大小）
     lockTimeoutMs: 30000   # 跨进程锁等待超时
     projectRoot: null      # 可选：显式项目根目录（默认取会话工作目录）
+    systemOne:             # 可选：System-one 召回门控，见下节
+      enabled: true
+      endpoint: https://api.typesafe.ai/v1/systemone
+      model: jev-latest
+      mode: noul           # noul | score
+      threshold: 0.5       # noul 模式：概率 ≥ 该值才保留
 ```
+
+## System-one 召回门控（可选）
+
+`mem_search` 的候选页可以交给一个 **System-one 模型**（默认 [TypeSafe Jev](https://docs.typesafe.ai)）
+做一次快速判断，把与当前任务**完全无关**的记忆从注入内容里剔除，只留下真正可复用的条目。
+
+- **默认不生效。** 只有配置了可用凭据（`apiKey` / `apiKeyEnv` 指向的凭据 / 环境变量）时门控才会运行；
+  没配就完全走原有召回路径，行为与开启前**逐字节一致**。
+- **失败即放行（fail-open）。** 端点超时、HTTP 非 2xx、响应无法解析……任何异常都会保留全部候选，
+  并在 `gated.degraded` + `gated.reason` 里说明原因。**坏掉的端点绝不会让记忆消失。**
+- **绝不返回空页。** 若模型把整页都判为无关，至少保留 `minKeep`（默认 1）条最相关候选，避免
+  「过滤掉了」和「本来就没有」变得无法区分。这种情况会在 `gated` 文本行里明说：该行带
+  `NOTE(no candidate scored above the threshold…)` 标记，兜底保留下来的条目不会被误读成
+  「真有候选通过了」。`judged=` 只计实际送判的条数，超出 `maxCandidates` 的部分以
+  `untouched=` 标出（未送判的候选永不剔除）。
+- **可回收。** `gated.dropped_hashes` 给出被剔除条目的 8 位短哈希，Agent 或用户可随时
+  `mem_read <短哈希>` 把误删的记忆读回来。
+- **可审计。** 每条候选的概率/分数与 keep/drop 判定写入插件日志（不占用模型上下文）；端点返回的
+  `usage.input_tokens` 记在 `gated.input_tokens` 里，门控自身的开销可被直接测量。
+
+### 配置字段
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关；无凭据时仍是无操作 |
+| `endpoint` | `https://api.typesafe.ai/v1/systemone` | 任何兼容该请求/应答契约的端点（含自建、LiteLLM 透传等） |
+| `model` | `jev-latest` | 请求体里的模型标识 |
+| `apiKey` | — | 声明为 `role("secret")`：读取时被脱敏、表单里只写不回显 |
+| `apiKeyEnv` | `TYPESAFE_API_KEY` | 凭据引用名；按「字面 key → 凭据服务 → 环境变量」顺序解析 |
+| `mode` | `noul` | `noul`（是与否概率）或 `score`（分级打分） |
+| `threshold` | `0.5` | `noul` 模式：概率 ≥ 该值保留 |
+| `scoreMin` | `2` | `score` 模式阈值。注意 Jev 的 `score` 是 `Σ(层级序号 × 概率)`，范围是 0…层级数−1（默认 5 层 → 0…4），**不是 0–1** |
+| `minKeep` | `1` | 整页被拒时至少保留几条 |
+| `maxCandidates` | `20` | 单次请求最多判定多少条；超出部分**不判定、不剔除** |
+| `maxTaskChars` | `2000` | 任务文本截断长度 |
+| `timeoutMs` | `8000` | 请求超时 |
+
+以上字段全部标记为 `.volatile()`——这是 DSH 设置平面**能够看到并即时生效**的前提条件。
+
+### 设置页
+
+插件自带一个设置卡片（**设置 → GitMemo**），可直接开关召回闸门，并填写端点、模型与 API key，
+改动即时生效、无需重启。API key 通过凭据域写入，**不会作为明文配置项落盘**，表单也只写不回显。
+开关暂存的是 `systemOne.enabled`：关闭后召回行为与门控存在前逐字节一致；需要点**保存**才会写入
+（只拨开关是草稿）。未配置 `enabled` 时按开启处理，与该字段的宿主默认值一致。
+
+### 已知取舍
+
+- **英文优先。** Jev 的主要训练语言是英文，CJK 文本可用但官方标注准确率较低。门控的提问措辞固定为
+  英文，只有候选正文与任务文本可能是中文。
+- **上下文上限。** 单次请求 64k tokens，其中 `state` + 最长问题合计 32k。`maxCandidates` 与
+  `maxTaskChars` 就是为守住这条线而存在的。
+- **延迟在关键路径上。** 召回发生在每次仓库任务之前，门控会给 `mem_search` 增加一次网络往返
+  （实测约 0.4s 量级），因此 `timeoutMs` 默认 8s 且失败即放行。
+- **数据外发。** 记忆摘要会离开本机。TypeSafe 目前**不提供** zero data retention；若要避免外发，
+  可把 `endpoint` 指向自建实现（如 MIT 许可的 `jeff`）或本地端点。
+- **计费口径。** 按输入 token 计费（$0.042 / 百万输入 token，输出免费），不是按次计费。
 
 ## 记忆存放位置与格式
 

@@ -65,7 +65,91 @@ The bundle patch ships with sensible defaults; override them in the profile's
     searchLimit: 20        # max hits per mem_search call (page size)
     lockTimeoutMs: 30000   # cross-process lock wait timeout
     projectRoot: null      # optional explicit project root (defaults to the session cwd)
+    systemOne:             # optional System-one recall gate, see below
+      enabled: true
+      endpoint: https://api.typesafe.ai/v1/systemone
+      model: jev-latest
+      mode: noul           # noul | score
+      threshold: 0.5       # noul mode: keep a candidate when P(yes) >= this
 ```
+
+## System-one Recall Gate (optional)
+
+A `mem_search` page can be handed to a **System-one model** (TypeSafe Jev by
+default) for one fast judgement, so memories that are **completely unrelated**
+to the current task are dropped before they are injected. Only genuinely
+reusable entries survive.
+
+- **Inert by default.** The gate runs only when a usable credential is
+  configured (`apiKey`, the credential named by `apiKeyEnv`, or the environment
+  variable). With nothing configured, recall behaves **byte-for-byte** as it did
+  before the gate existed.
+- **Fails open.** A timeout, a non-2xx response, an unparseable body — any
+  failure keeps every candidate and reports why in `gated.degraded` +
+  `gated.reason`. **A broken endpoint can never hide a memory.**
+- **Never empties a page.** If the model rejects the whole page, at least
+  `minKeep` (default 1) best-ranked candidates are retained, so "the gate removed
+  it" and "there was nothing there" stay distinguishable. The tool's `gated` line
+  says so out loud — such a page carries a `NOTE(no candidate scored above the
+  threshold…)` marker, so a retained floor is never mistaken for a candidate that
+  genuinely passed. `judged=` counts only the candidates actually sent to the
+  endpoint, with anything past `maxCandidates` reported as `untouched=`
+  (unjudged candidates are never dropped).
+- **Recoverable.** `gated.dropped_hashes` lists 8-char hashes of dropped
+  entries; `mem_read <short-hash>` brings one back at any time.
+- **Auditable.** Every candidate's probability/score and keep/drop verdict goes
+  to the plugin log (off the model context), and the endpoint's reported
+  `usage.input_tokens` lands in `gated.input_tokens`, so the gate's own cost is
+  directly measurable.
+
+### Settings
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch; still a no-op without a credential |
+| `endpoint` | `https://api.typesafe.ai/v1/systemone` | Any endpoint speaking the same request/answer contract (self-hosted, LiteLLM pass-through, …) |
+| `model` | `jev-latest` | Model identifier sent in the request body |
+| `apiKey` | — | Declared `role("secret")`: redacted on read, write-only in the form |
+| `apiKeyEnv` | `TYPESAFE_API_KEY` | Credential reference; resolved literal key → credentials service → environment |
+| `mode` | `noul` | `noul` (yes/no probability) or `score` (graded levels) |
+| `threshold` | `0.5` | `noul` mode: keep when P(yes) ≥ this |
+| `scoreMin` | `2` | `score` mode cutoff. Note Jev's `score` is `Σ(level_index × probability)`, ranging 0…levels−1 (5 levels → 0…4), **not 0–1** |
+| `minKeep` | `1` | Candidates retained when the whole page is rejected |
+| `maxCandidates` | `20` | Candidates judged per request; the remainder is **never judged and never dropped** |
+| `maxTaskChars` | `2000` | Task-text truncation length |
+| `timeoutMs` | `8000` | Request deadline |
+
+Every field is marked `.volatile()` — that is the precondition for the DSH
+settings plane to see the entry and apply edits live.
+
+### Settings page
+
+The plugin ships a settings card (**Settings → GitMemo**) where the gate can be
+switched on and off and the endpoint, model and API key can be filled in
+directly, applying immediately with no restart. The API key is written through
+the credentials domain — it is **never persisted as a plaintext config value** —
+and the form is write-only. The switch stages `systemOne.enabled`; turning it off
+leaves recall byte-for-byte as it was before the gate existed, and a **Save** is
+what writes it (the switch alone is a draft). An absent `enabled` reads as on, so
+an unconfigured section shows the gate as enabled — which is what the host
+default does.
+
+### Known trade-offs
+
+- **English-first.** Jev's primary training language is English; CJK works but
+  the vendor documents lower accuracy. The gate's question wording is English;
+  only the candidate text and task text may be Chinese.
+- **Context ceiling.** 64k tokens per request, of which `state` + the longest
+  single question may use 32k. `maxCandidates` and `maxTaskChars` exist to hold
+  that line.
+- **Latency on the critical path.** Recall runs before every repo task, and the
+  gate adds one network round trip (~0.4s observed), so `timeoutMs` defaults to
+  8s and every failure path fails open.
+- **Data egress.** Memory summaries leave the machine. TypeSafe currently offers
+  **no** zero data retention; point `endpoint` at a self-hosted implementation
+  (e.g. MIT-licensed `jeff`) or a local endpoint to avoid egress entirely.
+- **Billing.** Priced per input token ($0.042 per million input tokens, output
+  free) — not per call.
 
 ## Memory Location & Format
 
