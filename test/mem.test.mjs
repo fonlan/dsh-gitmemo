@@ -470,6 +470,20 @@ test("search validates and deduplicates normalized query keywords", async () => 
   await assert.rejects(() => memo.search(["bad\nquery"]), /single line/);
 });
 
+test("search accepts up to 15 keywords and rejects 16 (write bound stays 12)", async () => {
+  const root = makeRepo();
+  const memo = new GitMemo(root);
+  await memo.write({ title: "[wide] query bound", summary: "query bound", keywords: ["wide", "bound"], content: "c" });
+  const fifteen = Array.from({ length: 15 }, (_, i) => `kw${i}`);
+  const wide = await memo.search(fifteen);
+  assert.equal(wide.total, 0); // none of them match, but the query is accepted
+  const lastIsCurrent = await memo.search([...fifteen.slice(0, 14), "wide"]);
+  assert.equal(lastIsCurrent.total, 1);
+  await assert.rejects(() => memo.search([...fifteen, "kw15"]), /1-15/);
+  // the same 15-keyword query is still invalid on the write side (2-12), and 13 stays rejected
+  await assert.rejects(() => memo.write({ title: "[w] t", summary: "s", keywords: fifteen, content: "c" }), /2-12/);
+});
+
 test("search recency: fresh entry outranks an equally-matched old entry; bonus stays under one keyword", async () => {
   const root = makeRepo();
   const memo = new GitMemo(root);
@@ -1454,6 +1468,7 @@ test("plugin: exports, config, scoped registration for root agents only, no mem_
   assert.match(rootRegistrations.sections[0].text, /mem_replace/);
   assert.match(rootRegistrations.sections[0].text, /mem_delete/);
   assert.match(rootRegistrations.sections[0].text, /BEFORE WORK/);
+  assert.match(rootRegistrations.sections[0].text, /1–15 个中英文关键词/);
   assert.match(rootRegistrations.sections[0].text, /END-OF-SESSION CHECKPOINT/);
 
   // subagents get nothing
@@ -1490,6 +1505,7 @@ test("plugin tools work end-to-end with the new contracts and legacy adapter", a
   // new contract: keywords array required
   const search = byName.mem_search;
   assert.equal(search.parameters.properties.keywords.type, "array");
+  assert.match(search.parameters.properties.keywords.description, /1-15/);
   assert.equal(search.parameters.properties.mode, undefined);
 
   const write = byName.mem_write;
@@ -1514,6 +1530,19 @@ test("plugin tools work end-to-end with the new contracts and legacy adapter", a
   const sBlankSnapshot = await search.execute({ keywords: ["tool"], snapshot: "" }, exec);
   assert.equal(sBlankSnapshot.results[0].hash, w.hash);
   assertLosslessJson(sBlankSnapshot);
+
+  // search takes up to 15 query keywords; 16 is rejected through the tool surface too
+  const fifteenQuery = Array.from({ length: 14 }, (_, i) => `absent${i}`).concat("tool");
+  const sWide = await search.execute({ keywords: fifteenQuery }, exec);
+  assert.equal(sWide.results.length, 1);
+  assert.equal(sWide.results[0].hash, w.hash);
+  assertLosslessJson(sWide);
+  await assert.rejects(
+    () => search.execute({ keywords: fifteenQuery.concat("absent15") }, exec),
+    /1-15/
+  );
+  // write side keeps its own (tighter) bound
+  assert.match(write.parameters.properties.keywords.description, /2-12/);
 
   const readTool = byName.mem_read;
   const readOutput = await readTool.execute({ commit_hash: w.hash }, exec);

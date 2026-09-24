@@ -10,6 +10,15 @@ export declare const LOCK_FILE_NAME = ".mem.gitmemo.lock";
 export declare const MIGRATION_JOURNAL_NAME = ".mem.gitmemo-migration.json";
 /** Max entry content size. */
 export declare const MAX_CONTENT_BYTES: number;
+/** Upper bound on stored entry keywords (mem_write / mem_replace). */
+export declare const MAX_WRITE_KEYWORDS = 12;
+/**
+ * Upper bound on query keywords for one mem_search call. Deliberately higher
+ * than the write bound: recall is a fixed-string OR over the query terms, so a
+ * wider (still human-curated) query only widens recall, while every matched
+ * term still contributes to the score and the write side keeps entries tight.
+ */
+export declare const MAX_SEARCH_KEYWORDS = 15;
 /** Error type thrown by every gitmemo operation. */
 export declare class GitMemoError extends Error {
 }
@@ -349,7 +358,7 @@ export declare class GitMemo {
      * messages only, active-entry filtering, field-level matching and scoring,
      * snapshot-stable pagination, in-process LRU.
      *
-     * @param keywords - 1-12 keywords (legacy callers may pass a comma-separated string).
+     * @param keywords - 1-15 keywords (legacy callers may pass a comma-separated string).
      * @param options.skip - pagination offset.
      * @param options.snapshot - pass back the snapshot from the first page.
      */

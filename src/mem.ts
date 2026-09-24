@@ -37,6 +37,17 @@ export const MIGRATION_JOURNAL_NAME = ".mem.gitmemo-migration.json";
 /** Max entry content size. */
 export const MAX_CONTENT_BYTES = 1024 * 1024;
 
+/** Upper bound on stored entry keywords (mem_write / mem_replace). */
+export const MAX_WRITE_KEYWORDS = 12;
+
+/**
+ * Upper bound on query keywords for one mem_search call. Deliberately higher
+ * than the write bound: recall is a fixed-string OR over the query terms, so a
+ * wider (still human-curated) query only widens recall, while every matched
+ * term still contributes to the score and the write side keeps entries tight.
+ */
+export const MAX_SEARCH_KEYWORDS = 15;
+
 /** Error type thrown by every gitmemo operation. */
 export class GitMemoError extends Error {}
 
@@ -481,9 +492,9 @@ export function validateWriteInput(input: WriteInput, legacy = false): Validated
   if (!Array.isArray(input.keywords)) throw new GitMemoError("gitmemo: keywords must be an array");
   const rawKeywords = input.keywords.map((k) => (typeof k === "string" ? k.trim() : "")).filter((k) => k.length > 0);
   const minKeywords = legacy ? 0 : 2;
-  if (rawKeywords.length < minKeywords || rawKeywords.length > 12) {
+  if (rawKeywords.length < minKeywords || rawKeywords.length > MAX_WRITE_KEYWORDS) {
     throw new GitMemoError(
-      `gitmemo: keywords must contain ${minKeywords === 0 ? "0-12" : "2-12"} entries, got ${rawKeywords.length}`
+      `gitmemo: keywords must contain ${minKeywords === 0 ? "0" : "2"}-${MAX_WRITE_KEYWORDS} entries, got ${rawKeywords.length}`
     );
   }
   const keywords: string[] = [];
@@ -498,7 +509,7 @@ export function validateWriteInput(input: WriteInput, legacy = false): Validated
   }
   if (keywords.length < minKeywords) {
     throw new GitMemoError(
-      `gitmemo: keywords must contain ${minKeywords === 0 ? "0-12" : "2-12"} distinct entries after normalization, got ${keywords.length}`
+      `gitmemo: keywords must contain ${minKeywords === 0 ? "0" : "2"}-${MAX_WRITE_KEYWORDS} distinct entries after normalization, got ${keywords.length}`
     );
   }
 
@@ -1660,7 +1671,7 @@ export class GitMemo {
    * messages only, active-entry filtering, field-level matching and scoring,
    * snapshot-stable pagination, in-process LRU.
    *
-   * @param keywords - 1-12 keywords (legacy callers may pass a comma-separated string).
+   * @param keywords - 1-15 keywords (legacy callers may pass a comma-separated string).
    * @param options.skip - pagination offset.
    * @param options.snapshot - pass back the snapshot from the first page.
    */
@@ -1673,7 +1684,7 @@ export class GitMemo {
         .map((k) => k.trim())
         .filter((k) => k.length > 0)
         .map((k) => normalizeKeyword(k));
-      adapterWarning = "gitmemo: deprecation — mem_search.keywords as a comma-separated string; pass an array of 1-12 keywords";
+      adapterWarning = `gitmemo: deprecation — mem_search.keywords as a comma-separated string; pass an array of 1-${MAX_SEARCH_KEYWORDS} keywords`;
     } else {
       if (!Array.isArray(keywords)) throw new GitMemoError("gitmemo: search keywords must be an array");
       normalized = keywords.map((k) => normalizeKeyword(k));
@@ -1683,8 +1694,8 @@ export class GitMemo {
       adapterWarning = (adapterWarning ? adapterWarning + " " : "") +
         "gitmemo: deprecation — mem_search.mode is gone; recall is always OR";
     }
-    if (normalized.length < 1 || normalized.length > 12) {
-      throw new GitMemoError("gitmemo: search requires 1-12 non-empty keywords");
+    if (normalized.length < 1 || normalized.length > MAX_SEARCH_KEYWORDS) {
+      throw new GitMemoError(`gitmemo: search requires 1-${MAX_SEARCH_KEYWORDS} non-empty keywords`);
     }
     const skip = options.skip ?? 0;
     if (!Number.isInteger(skip) || skip < 0) throw new GitMemoError("gitmemo: skip must be a non-negative integer");

@@ -27,7 +27,7 @@
 
 | 内容 | 说明 |
 | --- | --- |
-| `mem_search` | 搜索记忆：`keywords`（1–12 个关键词数组，建议中英文同义词）、`skip` + `snapshot`（稳定分页）。每次最多返回 20 条带 `summary` / `keywords` / `kind` / `matched_keywords` 的评分结果（score = 命中关键词数 + recency 加成） |
+| `mem_search` | 搜索记忆：`keywords`（1–15 个关键词数组，建议中英文同义词）、`skip` + `snapshot`（稳定分页）。每次最多返回 20 条带 `summary` / `keywords` / `kind` / `matched_keywords` 的评分结果（score = 命中关键词数 + recency 加成） |
 | `mem_read` | 按创建/替换提交哈希读取一条记忆的完整 markdown（历史哈希仍可读）；返回 `kind`；可选 `expand: true` 一跳展开条目内的 `[[hash]]` 链接 |
 | `mem_write` | 存储任务结论：`title` + `summary` + `keywords`（2–12）+ `content`（front matter 由引擎生成），可选 `kind`（`"task"` 缺省 / `"topic"` 聚合页）、`related_branches` / `related_paths`。每个不可变文件对应一个 ADD 提交 |
 | `mem_delete` | 作废无替代结论（需要 `commit_hash` + `reason`） |
@@ -156,7 +156,7 @@ git -C .mem show <commit-hash>
 
 ## Agent 工作流（常驻规则，仅根 Agent）
 
-1. **开工前 —— 搜索。** 仓库相关任务开始前提取 1–12 个中英文关键词 → `mem_search`。纯闲聊和通用问答无需搜索。
+1. **开工前 —— 搜索。** 仓库相关任务开始前提取 1–15 个中英文关键词 → `mem_search`。纯闲聊和通用问答无需搜索。
 2. **结果预筛。** 根据 `title` / `summary` / `keywords` / `score` / `matched_keywords` 最多
    `mem_read` 5 条最相关记忆（`kind: "topic"` 的条目是该主题的聚合入口，优先读）；用 `skip` + 返回的
    `snapshot` 翻页。

@@ -28,7 +28,7 @@ dependency, and no manual memory commands are ever needed.
 
 | Piece | Description |
 | --- | --- |
-| `mem_search` | Search memories: `keywords` (array of 1–12, 中英文同义词), `skip` + `snapshot` (stable pagination). Returns up to 20 scored hits with `summary` / `keywords` / `kind` / `matched_keywords` (score = matched keywords + recency bonus) |
+| `mem_search` | Search memories: `keywords` (array of 1–15, 中英文同义词), `skip` + `snapshot` (stable pagination). Returns up to 20 scored hits with `summary` / `keywords` / `kind` / `matched_keywords` (score = matched keywords + recency bonus) |
 | `mem_read` | Read one memory entry by create/replace commit hash (full markdown; historical hashes stay readable); returns `kind`; optional `expand: true` resolves `[[hash]]` links one hop |
 | `mem_write` | Store a task outcome: `title` + `summary` + `keywords` (2–12) + `content` (engine generates front matter), optional `kind` (`"task"` default / `"topic"` aggregated page), `related_branches` / `related_paths`. One ADD commit per immutable file |
 | `mem_delete` | Withdraw an obsolete conclusion (requires `commit_hash` + `reason`) |
@@ -182,7 +182,7 @@ git -C .mem show <commit-hash>
 
 ## Agent Workflow (always-on rules, root agents)
 
-1. **Before work — search.** For repo-related tasks, extract 1–12 中英文关键词 → `mem_search`.
+1. **Before work — search.** For repo-related tasks, extract 1–15 中英文关键词 → `mem_search`.
    Pure chat and general Q&A need no search.
 2. **Preselect results.** Based on `title` / `summary` / `keywords` / `score` /
    `matched_keywords`, `mem_read` at most 5 most relevant memories (`kind: "topic"` entries
