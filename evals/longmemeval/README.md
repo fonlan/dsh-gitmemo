@@ -232,7 +232,9 @@ node --max-old-space-size=8192 evals/longmemeval/run_retrieval.mjs --split oracl
 node --max-old-space-size=8192 evals/longmemeval/run_retrieval.mjs --split s --concurrency 8
 ```
 
-`_abs` instances excluded, as upstream does; n = 470 non-abstention instances.
+`_abs` instances excluded, as upstream does; n = 470 non-abstention instances. A full run at
+**turn** granularity (48.7 min, ~122 000 memory writes, also 500/500 and zero failures) is in the
+granularity section below and is where the gap to BM25 nearly closes.
 
 | Retriever | r_any@5 | r_all@5 | ndcg@5 | r_all@10 | ndcg@10 | r_all@50 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -273,6 +275,41 @@ ingestion — a stand-in for the agent that would really write the memory. The a
 prefix summary plus plain tf×idf ranking can retrieve *nothing* for a question whose evidence
 sits deep in a session. These numbers should therefore be read as a **lower bound for a
 keyword-grep memory**, with the `llm` ingestion policy as the realistic operating point.
+
+### Granularity: turn-level memories suit a keyword store far better
+
+Same data, same engine, same queries, **only the size of the memory unit changed** — one entry per
+session vs one entry per user turn. 500/500 instances, zero failures, 48.7 min (≈122 000 writes).
+
+| Run | retrieval unit | `gitmemo` r_all@5 | `bm25` r_all@5 | gap |
+| --- | --- | --- | --- | --- |
+| `--granularity session` | 1 session (~48/instance) | 0.7362 | 0.8702 | **+0.1340** |
+| `--granularity turn` | 1 user turn (~245/instance) | 0.7319 | 0.7596 | **+0.0277** |
+
+(Comparable rows: the session-level block of each run — the turn run's is produced by the
+turn→session collapse.)
+
+The gap to a full-text BM25 index nearly disappears, 0.134 → 0.028, even though `gitmemo`'s own
+score barely moves. The reason is structural: `mem_write`'s retrieval surface is a title, a
+summary and at most 12 keywords, which is a large fraction of one short turn but only a small
+fraction of a long session. **The lossy step is the projection, so keep what you project small.**
+The cost is real — ~245× more entries, ~50 min instead of ~8 min on `_S` — but it removes most of
+the retrieval handicap.
+
+Official turn-level numbers from the same run:
+
+| Retriever | turn r_any@5 | turn r_all@5 | turn r_all@10 | turn ndcg@5 | turn ndcg@10 |
+| --- | --- | --- | --- | --- | --- |
+| `gitmemo` | 0.7660 | 0.6681 | 0.7426 | 0.5896 | 0.6115 |
+| `bm25` | 0.7809 | 0.6936 | 0.7830 | 0.6073 | 0.6324 |
+| `oracle` | 0.8915 | 0.9872 | 1.0000 | 0.8915 | 0.8915 |
+
+Per type at turn granularity, `gitmemo` `recall_all@10`: `single-session-assistant` 0.964,
+`single-session-user` 0.938, `knowledge-update` 0.903, `temporal-reasoning` 0.709,
+`multi-session` 0.562, `single-session-preference` **0.400** — *worse* than the 0.500 it scores at
+session granularity. A stated preference is usually spread across a conversation rather than
+localised in one turn, so splitting the session discards the context that made it retrievable.
+Granularity is a per-question-type tradeoff, not a global win.
 
 ### Ablation: the ingestion policy is the dominant variable
 
