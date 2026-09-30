@@ -22,7 +22,7 @@
  */
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { GitMemo, GitMemoError, resolveProjectRoot, type GitMemoConfig, type SearchOutput } from "./mem.js";
+import { GitMemo, GitMemoError, resolveProjectRoot, type GitMemoConfig, type SearchOutput, type SearchScoring } from "./mem.js";
 import { evaluateGate, type GateCandidate, type GateDecision, type GateOptions, type SystemOneMode } from "./systemone.js";
 
 /** Cordis plugin name. */
@@ -37,6 +37,21 @@ const Config = z.object({
   memDirName: z.string().default(".mem"),
   /** Max search hits per mem_search call (page size). Default 20. */
   searchLimit: z.number().default(20),
+  /**
+   * How a matched entry is scored (search order only — matching itself is
+   * identical in both modes).
+   *
+   * - `weighted` (default): sum of per-keyword rarity weights within the
+   *   recall page, so a distinctive match outranks several common ones.
+   * - `count`: the previous default behaviour (one point per matched keyword plus the
+   *   recency bonus), kept for exact backwards compatibility.
+   *
+   * Measured motivation: on LongMemEval `_S` the engine reached
+   * recall_all@50 = 0.998 while ndcg@5 was only 0.686 — evidence was reachable
+   * but ranked poorly, because a saturated-free match count cannot tell a rare
+   * keyword from a ubiquitous one.
+   */
+  searchScoring: z.union(["count", "weighted"]).default("weighted"),
   /** @deprecated — `.mem` always stays on main; kept for one version, no effect. */
   branchAlign: z.boolean().default(true),
   /** @deprecated — session-start recent seeding was removed; kept for one version, no effect. */
@@ -107,6 +122,8 @@ interface SystemOneConfig {
 
 interface ResolvedConfig {
   searchLimit: number;
+  /** Search scoring mode passed to the engine; see the `searchScoring` schema field. */
+  searchScoring: SearchScoring;
   lockTimeoutMs: number;
   projectRoot?: string;
   /**
@@ -257,7 +274,8 @@ async function engineFor(exec: unknown, config: ResolvedConfig): Promise<GitMemo
   const root = config.projectRoot ?? (await resolveProjectRoot(cwd));
   const engineConfig: GitMemoConfig = {
     searchLimit: config.searchLimit,
-    lockTimeoutMs: config.lockTimeoutMs
+    lockTimeoutMs: config.lockTimeoutMs,
+    searchScoring: config.searchScoring
   };
   return new GitMemo(root, engineConfig);
 }
@@ -284,7 +302,10 @@ const SEARCH_HIT = {
     score: {
       type: "number",
       required: true,
-      description: "Relevance: distinct matched keywords + a mild recency bonus (≤ +0.5, decaying to 0 by ~180 days)."
+      description:
+        "Relevance. In the default `weighted` scoring: the summed rarity of the matched keywords within this page " +
+        "(a distinctive match outweighs several common ones) plus a mild recency bonus (≤ +0.5, decaying to 0 by ~180 days). " +
+        "With `searchScoring: count`: distinct matched keywords + the same recency bonus."
     },
     matched_keywords: {
       type: "array",
@@ -925,6 +946,7 @@ async function apply(
   config: Partial<{
     memDirName?: string;
     searchLimit?: number;
+    searchScoring?: SearchScoring;
     branchAlign?: boolean;
     recentContextLimit?: number;
     lockTimeoutMs?: number;
@@ -938,6 +960,7 @@ async function apply(
   };
   const resolved: ResolvedConfig = {
     searchLimit: config.searchLimit ?? 20,
+    searchScoring: config.searchScoring ?? "weighted",
     lockTimeoutMs: config.lockTimeoutMs ?? 30000,
     projectRoot: config.projectRoot,
     log,

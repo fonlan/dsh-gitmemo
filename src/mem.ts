@@ -59,6 +59,17 @@ export interface GitMemoConfig {
   gitTimeoutMs?: number;
   /** Cross-process lock wait timeout in milliseconds. Default 30000. */
   lockTimeoutMs?: number;
+  /**
+   * How `mem_search` scores a matched entry.
+   *
+   * - `weighted` (default): sum of per-keyword rarity weights over the recall
+   *   page. A distinctive match outranks several common ones.
+   * - `count`: the previous default behaviour — one point per matched keyword plus the
+   *   recency bonus. Kept for exact backwards compatibility.
+   *
+   * Both modes match the same entries; only the ordering differs.
+   */
+  searchScoring?: SearchScoring;
   /** @deprecated parsed for compatibility only — the memory dir is fixed at `<projectRoot>/.mem`. */
   memDirName?: string;
   /** @deprecated parsed for compatibility only — `.mem` always stays on main. */
@@ -66,6 +77,12 @@ export interface GitMemoConfig {
   /** @deprecated parsed for compatibility only — session-start recent seeding was removed. */
   recentContextLimit?: number;
 }
+
+/** Search scoring mode; see {@link GitMemoConfig.searchScoring}. */
+export type SearchScoring = "count" | "weighted";
+
+/** Accepted `searchScoring` values, for config validation and tool schemas. */
+export const SEARCH_SCORING_MODES: readonly SearchScoring[] = ["count", "weighted"];
 
 /** One scored search hit. */
 export interface SearchHit {
@@ -756,6 +773,23 @@ export function recencyBonus(committerTime: number, nowMs: number = Date.now()):
   if (ageDays <= 30) return 0.5;
   if (ageDays >= 180) return 0;
   return Math.round(((0.5 * (180 - ageDays)) / 150) * 100) / 100;
+}
+
+/**
+ * Rarity weight of a keyword matched by `df` of `n` candidates, in the
+ * BM25-style form already used across this project. A term matched by every
+ * candidate is worth almost nothing; a term matched by one candidate out of
+ * many is worth the most.
+ *
+ * Used by `searchScoring: "weighted"` so a distinctive match can outrank a
+ * pile of common ones. The weight is computed over the *recall page*, which
+ * costs no extra git call (the candidate commit messages are already in hand)
+ * and is the pool the ordering actually has to get right.
+ */
+export function keywordRarity(df: number, n: number): number {
+  if (n <= 0) return 0;
+  const present = Math.min(Math.max(df, 0), n);
+  return Math.log(1 + (n - present + 0.5) / (present + 0.5));
 }
 
 /** Commit trailer emitted only for topic pages (absence means "task"). */
@@ -1606,7 +1640,7 @@ function cacheSearch(key: string, value: SearchComputation): void {
 export class GitMemo {
   readonly root: string;
   readonly memDir: string;
-  private readonly config: Required<Pick<GitMemoConfig, "searchLimit" | "gitTimeoutMs" | "lockTimeoutMs">>;
+  private readonly config: Required<Pick<GitMemoConfig, "searchLimit" | "gitTimeoutMs" | "lockTimeoutMs" | "searchScoring">>;
 
   constructor(root: string, config: GitMemoConfig = {}) {
     this.root = resolve(root);
@@ -1617,10 +1651,17 @@ export class GitMemo {
       }
       return value;
     };
+    const scoring = config.searchScoring ?? "weighted";
+    if (!SEARCH_SCORING_MODES.includes(scoring)) {
+      throw new GitMemoError(
+        `gitmemo: searchScoring must be one of ${SEARCH_SCORING_MODES.join(" | ")}, got ${JSON.stringify(config.searchScoring)}`
+      );
+    }
     this.config = {
       searchLimit: positiveInt(config.searchLimit, 20, "searchLimit"),
       gitTimeoutMs: positiveInt(config.gitTimeoutMs, 60000, "gitTimeoutMs"),
-      lockTimeoutMs: positiveInt(config.lockTimeoutMs, 30000, "lockTimeoutMs")
+      lockTimeoutMs: positiveInt(config.lockTimeoutMs, 30000, "lockTimeoutMs"),
+      searchScoring: scoring
     };
     this.memDir = join(this.root, ".mem");
   }
@@ -1721,7 +1762,12 @@ export class GitMemo {
       return { ...resolved, blockedNote: note };
     });
 
-    const cacheKey = this.memDir + "\x00" + snapshot + "\x00" + normalized.join("\x00");
+    // The scoring mode is part of the key: two handles on the SAME repo with
+    // different `searchScoring` must not share a cached ranking. (Omitting it
+    // made an A/B of the two modes return identical results — the second
+    // handle simply read the first one's cached computation.)
+    const cacheKey =
+      this.memDir + "\x00" + snapshot + "\x00" + this.config.searchScoring + "\x00" + normalized.join("\x00");
     let computation = searchCache.get(cacheKey);
     if (computation === undefined) {
       computation = await this.computeSearch(snapshot, normalized, legacy);
@@ -1769,6 +1815,16 @@ export class GitMemo {
     const diagnostics: string[] = [...(legacySnapshot?.diagnostics ?? [])];
     const seenFiles = new Set<string>();
     const nowMs = Date.now();
+
+    // Two passes: collect the matching candidates first, then (in weighted
+    // mode) score each match by how rare its keyword is *within this recall
+    // page*. Saturation-free counting treats a distinctive term like
+    // "biscuit" exactly like a ubiquitous one, which is what the LongMemEval
+    // measurements pinned as the engine's ranking defect: evidence was almost
+    // always reachable (recall_all@50 = 0.998) but ranked poorly
+    // (ndcg_any@5 = 0.686). Rarity re-weights the same matches without
+    // changing which entries match at all, so recall is untouched by design.
+    const scored: Array<{ record: LogRecord; matched: string[] }> = [];
     for (const record of candidates) {
       if (record.added.length !== 1) {
         if (record.added.length > 1) diagnostics.push(`commit ${record.hash} adds ${record.added.length} entries; skipped`);
@@ -1789,6 +1845,25 @@ export class GitMemo {
         if (fields.some((field) => field.includes(kw))) matched.push(kw);
       }
       if (matched.length === 0) continue;
+      scored.push({ record, matched });
+    }
+
+    let weights: Map<string, number> | undefined;
+    if (this.config.searchScoring === "weighted" && scored.length > 0) {
+      weights = new Map();
+      for (const kw of kws) {
+        let df = 0;
+        for (const entry of scored) {
+          if (entry.matched.includes(kw)) df += 1;
+        }
+        weights.set(kw, keywordRarity(df, scored.length));
+      }
+    }
+
+    for (const { record, matched } of scored) {
+      const base = weights === undefined
+        ? matched.length
+        : matched.reduce((sum, kw) => sum + (weights.get(kw) ?? 0), 0);
       hits.push({
         hash: record.hash,
         title: record.message.subject,
@@ -1796,7 +1871,7 @@ export class GitMemo {
         summary: record.message.summary,
         keywords: record.message.keywords,
         kind: record.message.kind,
-        score: Math.round((matched.length + recencyBonus(record.committerTime, nowMs)) * 100) / 100,
+        score: Math.round((base + recencyBonus(record.committerTime, nowMs)) * 100) / 100,
         matched_keywords: matched
       });
     }

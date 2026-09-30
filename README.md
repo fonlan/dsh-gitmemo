@@ -16,7 +16,7 @@ dependency, and no manual memory commands are ever needed.
 - **Git-only** — no runtime dependency beyond the `git` CLI
 - **Token-efficient** — reuses prior conclusions via `mem_search`; subagents carry neither the workflow rules nor the tool schemas
 - **Immutable entries** — every write creates a new file; corrections use `mem_replace` (one commit deletes the old file and adds the new one), withdrawal uses `mem_delete`
-- **Knowledge freshness** — `mem_replace` is not just for user corrections: work that overrules a stored conclusion actively replaces it; `mem_search` scores hits as distinct matched keywords + a mild recency bonus (≤ +0.5, linearly decaying to 0 over ~180 days), so conflicting stale conclusions lose to their replacements
+- **Knowledge freshness** — `mem_replace` is not just for user corrections: work that overrules a stored conclusion actively replaces it; `mem_search` adds a mild recency bonus (≤ +0.5, linearly decaying to 0 over ~180 days) on top of the match score, so conflicting stale conclusions lose to their replacements
 - **Topic pages (MOC)** — a `kind: "topic"` entry aggregates a topic's "current truth": the summary states the currently-valid conclusions and the page evolves via `mem_replace` (kind is inherited), not per-task rewrites
 - **Wiki links between entries** — content references other entries as `[[<commit-hash>]]`; `mem_read` with `expand: true` resolves those links one hop and automatically follows the `GitMemo-Replaces` chain to a replaced target's active version (dangling links come back with an error)
 - **Structured search** — commit messages carry `GitMemo-*` trailers (keywords, digest, search-text projections); search is `git log --grep --fixed-strings` over commit messages only — entry bodies are never scanned
@@ -28,7 +28,7 @@ dependency, and no manual memory commands are ever needed.
 
 | Piece | Description |
 | --- | --- |
-| `mem_search` | Search memories: `keywords` (array of 1–15, 中英文同义词), `skip` + `snapshot` (stable pagination). Returns up to 20 scored hits with `summary` / `keywords` / `kind` / `matched_keywords` (score = matched keywords + recency bonus) |
+| `mem_search` | Search memories: `keywords` (array of 1–15, 中英文同义词), `skip` + `snapshot` (stable pagination). Returns up to 20 scored hits with `summary` / `keywords` / `kind` / `matched_keywords`. Score = the summed rarity of the matched keywords within the page (default) or the matched count (`searchScoring: count`), plus a recency bonus |
 | `mem_read` | Read one memory entry by create/replace commit hash (full markdown; historical hashes stay readable); returns `kind`; optional `expand: true` resolves `[[hash]]` links one hop |
 | `mem_write` | Store a task outcome: `title` + `summary` + `keywords` (2–12) + `content` (engine generates front matter), optional `kind` (`"task"` default / `"topic"` aggregated page), `related_branches` / `related_paths`. One ADD commit per immutable file |
 | `mem_delete` | Withdraw an obsolete conclusion (requires `commit_hash` + `reason`) |
@@ -63,6 +63,7 @@ The bundle patch ships with sensible defaults; override them in the profile's
 - id: dsh-gitmemo
   config:
     searchLimit: 20        # max hits per mem_search call (page size)
+    searchScoring: weighted  # weighted (default) | count — see "Search scoring"
     lockTimeoutMs: 30000   # cross-process lock wait timeout
     projectRoot: null      # optional explicit project root (defaults to the session cwd)
     systemOne:             # optional System-one recall gate, see below
@@ -72,6 +73,32 @@ The bundle patch ships with sensible defaults; override them in the profile's
       mode: noul           # noul | score
       threshold: 0.5       # noul mode: keep a candidate when P(yes) >= this
 ```
+
+## Search Scoring
+
+`mem_search` matches entries with a fixed-string OR grep over the commit-message
+projections — the title, the summary, and the entry's keywords (bodies are never
+scanned). Two modes decide the *order* of the matched entries; both match exactly
+the same entries:
+
+| `searchScoring` | Score | Trade-off |
+| --- | --- | --- |
+| `weighted` (default) | `Σ` rarity of each matched keyword within the recall page, plus the recency bonus | A distinctive match outranks several common ones. One match can beat two, which the `count` mode never allows. |
+| `count` | number of matched keywords, plus the recency bonus | The previous default arithmetic, kept for exact backwards compatibility. |
+
+Rarity is the BM25-style weight `log(1 + (n − df + 0.5) / (df + 0.5))` over the
+candidate page (`n` candidates, `df` matching the keyword), so it costs no extra
+git call. The recency bonus stays ≤ +0.5, so it only reorders near-equal scores.
+
+**Why this is the default.** On LongMemEval `_S` (500 instances, session
+granularity) the engine reached `recall_all@50 = 0.998` while `ndcg_any@5` was
+only 0.686: evidence was essentially always reachable but ranked badly, because
+a plain match count cannot distinguish a rare keyword from a ubiquitous one.
+Weighting the same matches lifted `recall_all@5` 0.738 → 0.755 and `ndcg@5`
+0.687 → 0.700 on identical ingested data, and `recall_all@50` was unchanged
+(0.998) — matching is untouched by construction.
+`evals/longmemeval/README.md` has the full run and the ablation across scoring,
+granularity and ingestion policy.
 
 ## System-one Recall Gate (optional)
 

@@ -46,21 +46,53 @@ const CONFIG = {
   maxQueryKeywords: Number(env("GITMEMO_LME_MAX_QUERY_KEYWORDS", "15")),
   readTopK: env("GITMEMO_LME_READ_BODIES", "1") !== "0",
   llmModel: env("GITMEMO_LME_LLM_MODEL", env("DSH_LME_MODEL", "deepseek-chat")),
-  llmBaseUrl: env("GITMEMO_LME_LLM_BASE_URL", env("DSH_LME_BASE_URL", "https://api.deepseek.com/v1"))
+  llmBaseUrl: env("GITMEMO_LME_LLM_BASE_URL", env("DSH_LME_BASE_URL", "https://api.deepseek.com/v1")),
+  /**
+   * Optional System-one recall gate, the same two-stage recall the plugin's
+   * mem_search tool performs (engine page -> gate -> survivors). Off by
+   * default. The endpoint default points at a LOCAL typesafe-compatible
+   * server, so nothing leaves the machine and there is no per-call cost.
+   */
+  gate: {
+    enabled: env("GITMEMO_LME_GATE", "0") !== "0",
+    endpoint: env("GITMEMO_LME_GATE_ENDPOINT", "http://127.0.0.1:8765/v1/systemone"),
+    model: env("GITMEMO_LME_GATE_MODEL", "laya-multilingual"),
+    mode: env("GITMEMO_LME_GATE_MODE", "noul"),
+    threshold: Number(env("GITMEMO_LME_GATE_THRESHOLD", "0.5")),
+    minKeep: Number(env("GITMEMO_LME_GATE_MIN_KEEP", "1")),
+    maxCandidates: Number(env("GITMEMO_LME_GATE_MAX_CANDIDATES", "20")),
+    maxTaskChars: Number(env("GITMEMO_LME_GATE_MAX_TASK_CHARS", "2000")),
+    timeoutMs: Number(env("GITMEMO_LME_GATE_TIMEOUT", "60000")),
+    apiKey: env("GITMEMO_LME_GATE_API_KEY", "local")
+  }
 };
 
 const STATE_FILE = ".gitmemo-lme-state.json";
 const users = new Map();
 let client;
 
-function llm() {
+/**
+ * The chat client must be built with `ChatClient.create` — the constructor takes
+ * `apiKey` verbatim and does NOT resolve it, so `new ChatClient(...)` yields
+ * `ready === false` and every LLM-written memory fails with "no API key
+ * available". Resolution order: explicit option → DEEPSEEK_API_KEY /
+ * OPENAI_API_KEY in the environment → the local DSH credential store.
+ */
+async function llm() {
   if (!client) {
-    client = new ChatClient({
+    client = await ChatClient.create({
       baseUrl: CONFIG.llmBaseUrl,
       model: CONFIG.llmModel,
+      apiKeyEnv: env("GITMEMO_LME_LLM_API_KEY_ENV", undefined),
       cacheDir: env("GITMEMO_LME_LLM_CACHE", join(CONFIG.baseDir, ".llm-cache")),
       concurrency: Number(env("GITMEMO_LME_LLM_CONCURRENCY", "4"))
     });
+    if (!client.ready) {
+      throw new Error(
+        "bridge: LLM ingestion is configured but no API key could be resolved " +
+          "(set DEEPSEEK_API_KEY / OPENAI_API_KEY, or store one in the DSH credential store)"
+      );
+    }
   }
   return client;
 }
@@ -125,7 +157,8 @@ async function describeSession({ messages, sessionId, stats }) {
       "Keywords are used later as FIXED-STRING OR greps by a future search, so prefer short, distinctive, " +
       "literal terms (names, places, objects, activities) over whole sentences or generic words.\n\n" +
       "Session (id " + String(sessionId) + "):\n" + text.slice(0, 12000);
-    const raw = await llm().chatJson([{ role: "user", content: prompt }], { maxTokens: 300 });
+    const chat = await llm();
+    const raw = await chat.chatJson([{ role: "user", content: prompt }], { maxTokens: 300 });
     const keywords = (Array.isArray(raw.keywords) ? raw.keywords : [])
       .map((k) => String(k).trim().toLowerCase())
       .filter((k) => k.length > 0 && k.length <= 64)
@@ -157,7 +190,8 @@ async function queryKeywordsFor(query, user) {
       "They are used as FIXED-STRING OR greps against past memory titles, summaries and keyword lists, so they must be " +
       "short literal topical terms or names a memory entry would plausibly contain verbatim — not sentences, not stopwords.\n" +
       'Reply with STRICT JSON only: {"keywords": ["..."]}\n\nQuestion: ' + query;
-    const raw = await llm().chatJson([{ role: "user", content: prompt }], { maxTokens: 200 });
+    const chat = await llm();
+    const raw = await chat.chatJson([{ role: "user", content: prompt }], { maxTokens: 200 });
     const kws = (Array.isArray(raw.keywords) ? raw.keywords : [])
       .map((k) => String(k).trim().toLowerCase())
       .filter((k) => k.length > 0 && k.length <= 64)
@@ -208,9 +242,33 @@ async function cmdAdd({ user_id, session_id, messages, timestamp }) {
 
 async function cmdSearch({ user_id, query, top_k }) {
   const user = await getUser(user_id);
-  const keywords = await queryKeywordsFor(String(query ?? ""), user);
+  const question = String(query ?? "");
+  const keywords = await queryKeywordsFor(question, user);
   const limit = Number(top_k ?? 20);
-  const { hashes, total, calls } = await searchHashes(user.memo, keywords, { topK: limit });
+  const gateOpts = CONFIG.gate.enabled
+    ? {
+        endpoint: CONFIG.gate.endpoint,
+        model: CONFIG.gate.model,
+        mode: CONFIG.gate.mode,
+        threshold: CONFIG.gate.threshold,
+        scoreMin: 2,
+        minKeep: CONFIG.gate.minKeep,
+        maxCandidates: CONFIG.gate.maxCandidates,
+        maxTaskChars: CONFIG.gate.maxTaskChars,
+        timeoutMs: CONFIG.gate.timeoutMs,
+        apiKey: CONFIG.gate.apiKey,
+        onDecision: (decision) => {
+          if (decision.degraded) {
+            process.stderr.write(`bridge: gate DEGRADED for ${user_id}: ${decision.reason ?? "unknown"}\n`);
+          }
+        }
+      }
+    : undefined;
+  const { hashes, total, calls, gateCalls, gateDropped } = await searchHashes(user.memo, keywords, {
+    topK: limit,
+    task: question,
+    gate: gateOpts
+  });
   const memories = [];
   for (const hash of hashes) {
     const known = user.entries.find((e) => e.hash === hash);
@@ -227,7 +285,13 @@ async function cmdSearch({ user_id, query, top_k }) {
     }
     if (entry.content.length > 0 || entry.title.length > 0) memories.push(entry);
   }
-  return { keywords, total, search_calls: calls, memories };
+  return {
+    keywords,
+    total,
+    search_calls: calls,
+    ...(gateOpts ? { gate_calls: gateCalls, gate_dropped: gateDropped } : {}),
+    memories
+  };
 }
 
 async function cmdDelete({ user_id }) {
@@ -250,12 +314,19 @@ async function cmdClose() {
 }
 
 const COMMANDS = {
-  ping: async () => ({
-    engine: ENGINE_PATH,
-    config: CONFIG,
-    llmReady: llm().ready,
-    node: process.version
-  }),
+  ping: async () => {
+    // Only resolve the credential when a mode actually needs the LLM, so the
+    // deterministic modes still start with no key present.
+    const needsLlm = CONFIG.ingestKeywords === "llm" || CONFIG.queryKeywords === "llm";
+    const chat = needsLlm ? await llm() : undefined;
+    return {
+      engine: ENGINE_PATH,
+      config: CONFIG,
+      llmNeeded: needsLlm,
+      llmReady: chat ? chat.ready : false,
+      node: process.version
+    };
+  },
   add: cmdAdd,
   search: cmdSearch,
   delete: cmdDelete,

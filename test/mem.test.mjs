@@ -379,7 +379,10 @@ test("wiki links: mem_read expand resolves [[hash]] one hop, follows replacement
 
 test("search: OR recall over title/summary/keywords only; body-only words never hit; score and matched_keywords", async () => {
   const root = makeRepo();
-  const memo = new GitMemo(root);
+    // Pinned to `searchScoring: "count"`: this test asserts the pre-0.5
+  // score arithmetic (one point per matched keyword + recency). The engine's
+  // default is now `weighted`; see test/scoring.test.mjs for that contract.
+  const memo = new GitMemo(root, { searchScoring: "count" });
   const a = await memo.write({
     title: "[auth] add login rate limit",
     summary: "Per-IP limiting with Redis.",
@@ -459,7 +462,10 @@ test("search: normalization (NFKC, case folding, whitespace) and literal special
 
 test("search validates and deduplicates normalized query keywords", async () => {
   const root = makeRepo();
-  const memo = new GitMemo(root);
+    // Pinned to `searchScoring: "count"`: this test asserts the pre-0.5
+  // score arithmetic (one point per matched keyword + recency). The engine's
+  // default is now `weighted`; see test/scoring.test.mjs for that contract.
+  const memo = new GitMemo(root, { searchScoring: "count" });
   const entry = await memo.write({ title: "[q] auth entry", summary: "auth", keywords: ["auth", "query"], content: "c" });
   const found = await memo.search(["Auth", "ＡＵＴＨ", "auth"]);
   assert.equal(found.results.length, 1);
@@ -486,7 +492,10 @@ test("search accepts up to 15 keywords and rejects 16 (write bound stays 12)", a
 
 test("search recency: fresh entry outranks an equally-matched old entry; bonus stays under one keyword", async () => {
   const root = makeRepo();
-  const memo = new GitMemo(root);
+    // Pinned to `searchScoring: "count"`: this test asserts the pre-0.5
+  // score arithmetic (one point per matched keyword + recency). The engine's
+  // default is now `weighted`; see test/scoring.test.mjs for that contract.
+  const memo = new GitMemo(root, { searchScoring: "count" });
   // an entry committed ~300 days ago (beyond the 180-day recency window)
   const oldDate = new Date(Date.now() - 300 * 86400 * 1000).toISOString().replace(/\.\d{3}Z$/, "+00:00");
   process.env.GIT_COMMITTER_DATE = oldDate;

@@ -15,7 +15,7 @@
 - **仅依赖 Git** —— 除 `git` CLI 外无任何运行时依赖
 - **省 token** —— 通过 `mem_search` 复用既有结论；子代理既不携带工作流规则也不携带工具 schema
 - **条目不可变** —— 每次写入都创建新文件；更正用 `mem_replace`（一个提交同时删除旧文件、新增新文件），作废用 `mem_delete`
-- **知识保鲜** —— `mem_replace` 不只用于用户更正：本次工作覆盖旧结论时同样主动替换；`mem_search` 评分为「命中关键词数 + 温和的 recency 加成（≤ +0.5，180 天线性衰减到 0）」，新旧结论冲突时自动偏向新条目
+- **知识保鲜** —— `mem_replace` 不只用于用户更正：本次工作覆盖旧结论时同样主动替换；`mem_search` 在匹配分之上叠加温和的 recency 加成（≤ +0.5，180 天线性衰减到 0），新旧结论冲突时自动偏向新条目
 - **主题聚合页（MOC）** —— `kind: "topic"` 条目聚合一个主题的「当前真相」：summary 概括当下有效结论，靠 `mem_replace` 演进（kind 自动继承），不按任务重复新增
 - **条目间 Wiki 链接** —— content 里用 `[[<commit-hash>]]` 引用其他条目；`mem_read` 传 `expand: true` 一跳展开链接目标，并自动跟随 `GitMemo-Replaces` 链到被替换条目的最新版本（悬空链接带 error 返回）
 - **结构化搜索** —— commit message 携带 `GitMemo-*` trailers（keywords、digest、search-text 投影）；搜索只对 commit message 执行 `git log --grep --fixed-strings`，绝不扫描条目正文
@@ -27,7 +27,7 @@
 
 | 内容 | 说明 |
 | --- | --- |
-| `mem_search` | 搜索记忆：`keywords`（1–15 个关键词数组，建议中英文同义词）、`skip` + `snapshot`（稳定分页）。每次最多返回 20 条带 `summary` / `keywords` / `kind` / `matched_keywords` 的评分结果（score = 命中关键词数 + recency 加成） |
+| `mem_search` | 搜索记忆：`keywords`（1–15 个关键词数组，建议中英文同义词）、`skip` + `snapshot`（稳定分页）。每次最多返回 20 条带 `summary` / `keywords` / `kind` / `matched_keywords` 的评分结果。score = 本页内命中关键词的稀有度之和（默认）或命中条数（`searchScoring: count`），再加 recency 加成 |
 | `mem_read` | 按创建/替换提交哈希读取一条记忆的完整 markdown（历史哈希仍可读）；返回 `kind`；可选 `expand: true` 一跳展开条目内的 `[[hash]]` 链接 |
 | `mem_write` | 存储任务结论：`title` + `summary` + `keywords`（2–12）+ `content`（front matter 由引擎生成），可选 `kind`（`"task"` 缺省 / `"topic"` 聚合页）、`related_branches` / `related_paths`。每个不可变文件对应一个 ADD 提交 |
 | `mem_delete` | 作废无替代结论（需要 `commit_hash` + `reason`） |
@@ -61,6 +61,7 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
 - id: dsh-gitmemo
   config:
     searchLimit: 20        # 每次 mem_search 返回的最大条数（每页大小）
+    searchScoring: weighted  # weighted（默认）| count —— 见「检索评分」
     lockTimeoutMs: 30000   # 跨进程锁等待超时
     projectRoot: null      # 可选：显式项目根目录（默认取会话工作目录）
     systemOne:             # 可选：System-one 召回门控，见下节
@@ -70,6 +71,19 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
       mode: noul           # noul | score
       threshold: 0.5       # noul 模式：概率 ≥ 该值才保留
 ```
+
+## 检索评分
+
+`mem_search` 用固定字符串 OR grep 在提交消息投影上匹配——即标题、摘要与条目的关键词（正文从不扫描）。两种模式决定**顺序**，匹配到的条目集合完全相同：
+
+| `searchScoring` | 分值 | 取舍 |
+| --- | --- | --- |
+| `weighted`（默认） | 本页内各命中关键词稀有度之和，再加 recency 加成 | 有区分度的命中能压过若干常见命中；一次命中可以胜过两次，这是 `count` 模式不允许的 |
+| `count` | 命中关键词条数，再加 recency 加成 | 此前的默认算法，为完全向后兼容保留 |
+
+稀有度用的是候选页上的 BM25 式权重 `log(1 + (n − df + 0.5) / (df + 0.5))`（`n` 为候选数，`df` 为命中该关键词的候选数），因此不增加额外 git 调用。recency 加成仍 ≤ +0.5，只用于重排近乎同分的条目。
+
+**为什么把它设为默认。** 在 LongMemEval `_S`（500 个实例、会话粒度）上，引擎的 `recall_all@50` 达到 0.998，而 `ndcg_any@5` 只有 0.686：证据基本都能召回，但排不上来——因为纯命中计数分不清罕见词与随处可见的词。在完全相同的入库数据上只改加权，`recall_all@5` 从 0.738 升到 0.755、`ndcg@5` 从 0.687 升到 0.700，而 `recall_all@50` 仍是 0.998（匹配逻辑在构造上未改动）。完整实验与「打分 / 粒度 / 写入策略」三组消融见 `evals/longmemeval/README.md`。
 
 ## System-one 召回门控（可选）
 

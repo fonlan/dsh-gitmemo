@@ -24,15 +24,20 @@ const execFileAsync = promisify(execFile);
 const ENGINE = new URL("../../../lib/mem.js", import.meta.url).href;
 const { GitMemo } = await import(ENGINE);
 
+// The System-one gate lives in the plugin layer (src/systemone.ts), not in the
+// engine; the eval imports it explicitly so `--gate` exercises the real
+// implementation rather than a stand-in.
+const { evaluateGate } = await import("../../../lib/systemone.js");
+
 export { GitMemo };
 
 export const ENGINE_PATH = ENGINE;
 
 /** Create a throwaway project root with an initialized `.mem` repository. */
-export async function createMemoRoot(root, { pageSize = 20, gitTimeoutMs = 120000 } = {}) {
+export async function createMemoRoot(root, { pageSize = 20, gitTimeoutMs = 120000, searchScoring = "weighted" } = {}) {
   await mkdir(root, { recursive: true });
   await execFileAsync("git", ["init", "-q"], { cwd: root });
-  const memo = new GitMemo(root, { searchLimit: pageSize, gitTimeoutMs, lockTimeoutMs: 60000 });
+  const memo = new GitMemo(root, { searchLimit: pageSize, gitTimeoutMs, lockTimeoutMs: 60000, searchScoring });
   await memo.init();
   return memo;
 }
@@ -160,21 +165,42 @@ export async function ingestInstance({ memo, items, ingestMode, stats, client, m
  * The simulated `mem_search` call: 1–15 keywords, paged with the returned
  * snapshot exactly like the agent tool does, until `topK` hits or exhaustion.
  */
-export async function searchHashes(memo, keywords, { topK = 50 } = {}) {
+export async function searchHashes(memo, keywords, { topK = 50, task, gate } = {}) {
   const hashes = [];
   let skip = 0;
   let snapshot;
   let total = Number.POSITIVE_INFINITY;
   let calls = 0;
+  let gateCalls = 0;
+  let gateDropped = 0;
   while (hashes.length < topK && skip < total) {
     const page = await memo.search(keywords, { skip, ...(snapshot ? { snapshot } : {}) });
     calls += 1;
     snapshot = page.snapshot;
     total = page.total;
     if (page.results.length === 0) break;
-    for (const hit of page.results) hashes.push(hit.hash);
+    let results = page.results;
+    if (gate) {
+      // The same two-stage recall the plugin's mem_search tool performs:
+      // engine page first, then the System-one gate over that page. The gate's
+      // own `minKeep` floor is preserved, so a wholly-rejected page still
+      // yields the configured minimum instead of silently emptying the page.
+      const decision = await evaluateGate(task ?? "", page.results, gate);
+      gateCalls += 1;
+      const kept = new Set(decision.kept);
+      gateDropped += page.results.filter((hit) => !kept.has(hit.hash)).length;
+      gate.onDecision?.(decision, page.results);
+      results = page.results.filter((hit) => kept.has(hit.hash));
+    }
+    for (const hit of results) hashes.push(hit.hash);
     skip += page.results.length;
     if (page.next_skip === null) break;
   }
-  return { hashes: hashes.slice(0, topK), total: Number.isFinite(total) ? total : hashes.length, calls };
+  return {
+    hashes: hashes.slice(0, topK),
+    total: Number.isFinite(total) ? total : hashes.length,
+    calls,
+    gateCalls,
+    gateDropped
+  };
 }

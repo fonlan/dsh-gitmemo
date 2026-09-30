@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import { buildCorpus, buildRankings, loadSplit, splitStats } from "./lib/dataset.mjs";
 import { aggregate, computeMetrics } from "./lib/metrics.mjs";
 import { corpusStats, bm25Rank, queryKeywords } from "./lib/text.mjs";
-import { createMemoRoot, ingestInstance, removeMemoRoot, renderContent, searchHashes, ENGINE_PATH } from "./lib/ingest.mjs";
+import { createMemoRoot, GitMemo, ingestInstance, removeMemoRoot, renderContent, searchHashes, ENGINE_PATH } from "./lib/ingest.mjs";
 import { ChatClient } from "./lib/llm.mjs";
 import { goldOnlyMeans, printConsoleSummary, renderMarkdownReport } from "./lib/report.mjs";
 
@@ -60,13 +60,61 @@ const splitKey = typeof args.split === "string" ? args.split : "oracle";
 const splitPath = args.data ? resolve(String(args.data)) : join(DATA_DIR, SPLITS[splitKey] ?? splitKey);
 const granularity = String(args.granularity ?? "session");
 if (!["session", "turn"].includes(granularity)) throw new Error(`--granularity must be session|turn`);
+const scoringMode = String(args.scoring ?? "weighted");
+if (!["count", "weighted"].includes(scoringMode)) throw new Error("--scoring must be count|weighted");
 const retrievers = String(args.retrievers ?? "gitmemo,bm25,oracle").split(",").map((s) => s.trim()).filter(Boolean);
+const gitmemoSpecs = retrievers.map(parseGitmemoSpec).filter((spec) => spec !== undefined);
+if (retrievers.some((r) => r.startsWith("gitmemo")) && gitmemoSpecs.length === 0) {
+  throw new Error(`unrecognised gitmemo retriever name(s): ${retrievers.filter((r) => r.startsWith("gitmemo")).join(", ")}`);
+}
 const queryKeywordMode = String(args["query-keywords"] ?? "plain");
 const ingestKeywordMode = String(args["ingest-keywords"] ?? "idf");
 const topK = Number(args.topk ?? 50);
 const pageSize = Number(args["page-size"] ?? 20);
 const concurrency = Number(args.concurrency ?? 8);
 const maxKeywords = Number(args["max-keywords"] ?? 12);
+/**
+ * gitmemo retrievers accept a configuration suffix, so one ingest pass can
+ * answer the whole 2x2: `gitmemo`, `gitmemo-count`, `gitmemo-gate`,
+ * `gitmemo-count-gate`. `gitmemo` alone keeps the engine's own default.
+ */
+function parseGitmemoSpec(name) {
+  // gitmemo[-count][-gate[-tNN][-k0]]
+  //   -tNN  gate threshold, NN percent (t35 -> 0.35)
+  //   -k0   gate minKeep 0: measure the gate withOUT the plugin's floor, which
+  //         is what actually reveals how much the floor protects (a wholly
+  //         rejected page keeps one candidate under the plugin default).
+  const m = /^gitmemo(?:-(count|weighted))?(?:-gate(?:-t(\d{1,2}))?(?:-k(\d+))?)?$/.exec(name);
+  if (m === null) return undefined;
+  const explicitMode = m[1];
+  return {
+    name,
+    count: explicitMode === "count" || (explicitMode === undefined && scoringMode === "count"),
+    gate: /-gate/.test(name),
+    gateThreshold: m[2] !== undefined ? Number(m[2]) / 100 : undefined,
+    gateMinKeep: m[3] !== undefined ? Number(m[3]) : undefined
+  };
+}
+
+/**
+ * System-one gate options. Defaults point at a LOCAL typesafe-compatible
+ * server, so nothing leaves the machine and there is no per-call cost.
+ */
+const gateOptions = {
+  endpoint: String(args["gate-endpoint"] ?? process.env.GITMEMO_GATE_ENDPOINT ?? "http://127.0.0.1:8765/v1/systemone"),
+  model: String(args["gate-model"] ?? process.env.GITMEMO_GATE_MODEL ?? "laya-multilingual"),
+  mode: String(args["gate-mode"] ?? "noul"),
+  threshold: Number(args["gate-threshold"] ?? 0.5),
+  scoreMin: Number(args["gate-score-min"] ?? 2),
+  // The plugin's own default: a wholly-rejected page still keeps one candidate.
+  // Pass --gate-min-keep 0 to measure the gate without that floor.
+  minKeep: Number(args["gate-min-keep"] ?? 1),
+  maxCandidates: Number(args["gate-max-candidates"] ?? 20),
+  maxTaskChars: Number(args["gate-max-task-chars"] ?? 2000),
+  timeoutMs: Number(args["gate-timeout"] ?? 60000),
+  apiKey: String(args["gate-api-key"] ?? process.env.GITMEMO_GATE_API_KEY ?? "local")
+};
+
 const summaryMode = String(args.summary ?? "extractive");
 const keywordScore = String(args["keyword-score"] ?? "bm25");
 if (!["extractive", "prefix"].includes(summaryMode)) throw new Error("--summary must be extractive|prefix");
@@ -164,9 +212,9 @@ async function processInstance(entry) {
   const diagnostics = { corpus_size: corpus.corpusIds.length, gold_count: corpus.gold.size };
   const t0 = Date.now();
 
-  if (retrievers.includes("gitmemo")) {
+  if (gitmemoSpecs.length > 0) {
     const root = join(workdirRoot, safeName(entry.question_id));
-    const memo = await createMemoRoot(root, { pageSize });
+    const memo = await createMemoRoot(root, { pageSize, searchScoring: "weighted" });
     try {
       const items = corpus.slots.map((slot, index) => ({
         docId: slot.docId,
@@ -190,14 +238,48 @@ async function processInstance(entry) {
         summaryMode,
         keywordScore
       });
+      // One ingestion, one query-keyword set, N retrieval configurations: the
+      // 2x2 of scoring mode x System-one gate costs a single ingest pass.
       const keywords = await queryFor(entry.question, instanceStats);
       diagnostics.query_keywords = keywords;
-      const { hashes, total, calls } = await searchHashes(memo, keywords, { topK });
       diagnostics.gitmemo_entries = items.length;
-      diagnostics.gitmemo_total_hits = total;
-      diagnostics.gitmemo_search_calls = calls;
-      diagnostics.gitmemo_missing = hashes.filter((h) => !hashToDocId.has(h)).length;
-      ranked.gitmemo = hashes.map((h) => hashToDocId.get(h)).filter(Boolean);
+      const goldDocIds = corpus.gold;
+      for (const spec of gitmemoSpecs) {
+        const scoring = spec.count ? "count" : "weighted";
+        const handle = scoring === "weighted"
+          ? memo
+          : new GitMemo(root, { searchLimit: pageSize, searchScoring: "count", gitTimeoutMs: 120000 });
+        let droppedGold = 0;
+        const gate = spec.gate
+          ? {
+              ...gateOptions,
+              ...(spec.gateThreshold !== undefined ? { threshold: spec.gateThreshold } : {}),
+              ...(spec.gateMinKeep !== undefined ? { minKeep: spec.gateMinKeep } : {}),
+              onDecision: (decision, page) => {
+                for (const verdict of decision.verdicts) {
+                  if (verdict.keep) continue;
+                  const docId = hashToDocId.get(verdict.hash);
+                  if (docId !== undefined && goldDocIds.has(docId)) droppedGold += 1;
+                }
+                void page;
+              }
+            }
+          : undefined;
+        const { hashes, total, calls, gateCalls, gateDropped } = await searchHashes(handle, keywords, {
+          topK,
+          task: entry.question,
+          gate
+        });
+        const docIds = hashes.map((h) => hashToDocId.get(h)).filter(Boolean);
+        ranked[spec.name] = docIds;
+        diagnostics[`${spec.name}__total_hits`] = total;
+        diagnostics[`${spec.name}__search_calls`] = calls;
+        if (spec.gate) {
+          diagnostics[`${spec.name}__gate_calls`] = gateCalls;
+          diagnostics[`${spec.name}__gate_dropped`] = gateDropped;
+          diagnostics[`${spec.name}__gate_dropped_gold`] = droppedGold;
+        }
+      }
     } finally {
       if (!keepWorkdir) await removeMemoRoot(root);
     }
@@ -335,6 +417,17 @@ const run = {
     ingestKeywords: ingestKeywordMode,
     summaryMode,
     keywordScore,
+    searchScoring: scoringMode,
+    gate: gitmemoSpecs.some((spec) => spec.gate)
+      ? {
+          endpoint: gateOptions.endpoint,
+          model: gateOptions.model,
+          mode: gateOptions.mode,
+          threshold: gateOptions.threshold,
+          minKeep: gateOptions.minKeep,
+          maxCandidates: gateOptions.maxCandidates
+        }
+      : null,
     topK,
     pageSize,
     concurrency,

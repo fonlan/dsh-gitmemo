@@ -30,6 +30,17 @@ export interface GitMemoConfig {
     gitTimeoutMs?: number;
     /** Cross-process lock wait timeout in milliseconds. Default 30000. */
     lockTimeoutMs?: number;
+    /**
+     * How `mem_search` scores a matched entry.
+     *
+     * - `weighted` (default): sum of per-keyword rarity weights over the recall
+     *   page. A distinctive match outranks several common ones.
+     * - `count`: the previous default behaviour — one point per matched keyword plus the
+     *   recency bonus. Kept for exact backwards compatibility.
+     *
+     * Both modes match the same entries; only the ordering differs.
+     */
+    searchScoring?: SearchScoring;
     /** @deprecated parsed for compatibility only — the memory dir is fixed at `<projectRoot>/.mem`. */
     memDirName?: string;
     /** @deprecated parsed for compatibility only — `.mem` always stays on main. */
@@ -37,6 +48,10 @@ export interface GitMemoConfig {
     /** @deprecated parsed for compatibility only — session-start recent seeding was removed. */
     recentContextLimit?: number;
 }
+/** Search scoring mode; see {@link GitMemoConfig.searchScoring}. */
+export type SearchScoring = "count" | "weighted";
+/** Accepted `searchScoring` values, for config validation and tool schemas. */
+export declare const SEARCH_SCORING_MODES: readonly SearchScoring[];
 /** One scored search hit. */
 export interface SearchHit {
     hash: string;
@@ -267,6 +282,18 @@ export declare function buildEntryMarkdown(input: ValidatedWriteInput, ctx: Code
  * matched keyword, so freshness only reorders equal-match entries.
  */
 export declare function recencyBonus(committerTime: number, nowMs?: number): number;
+/**
+ * Rarity weight of a keyword matched by `df` of `n` candidates, in the
+ * BM25-style form already used across this project. A term matched by every
+ * candidate is worth almost nothing; a term matched by one candidate out of
+ * many is worth the most.
+ *
+ * Used by `searchScoring: "weighted"` so a distinctive match can outrank a
+ * pile of common ones. The weight is computed over the *recall page*, which
+ * costs no extra git call (the candidate commit messages are already in hand)
+ * and is the pool the ordering actually has to get right.
+ */
+export declare function keywordRarity(df: number, n: number): number;
 /** ADD commit message (plan 4.1). */
 export declare function buildAddMessage(title: string, summary: string, keywords: string[], digest: string, legacy?: boolean, kind?: "task" | "topic"): string;
 /** DELETE commit message (plan 4.2). */
