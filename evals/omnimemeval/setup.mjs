@@ -6,7 +6,8 @@
  *   1. clones OmniMemEval at a pinned commit (default below) into `.omnimemeval/`
  *   2. symlinks this directory's `gitmemo_client.py` into `scripts/client_factory/`
  *   3. adds the two one-line registrations upstream requires for a new backend
- *      (`client_factory/registry.py` and `utils/search_helpers.py` dispatch)
+ *      (`client_factory/registry.py` and `utils/search_helpers.py` dispatch) and patches
+ *      `utils/nlp_metrics.py`'s judge-label parser, which drops ~7% of instances
  *   4. symlinks the LongMemEval `_S` split we already downloaded
  *   5. creates a Python 3.12 venv with `uv` (light deps by default; `--full`
  *      adds the torch/bert-score NLP stack that steps 4–5 import)
@@ -135,6 +136,14 @@ if (searchHelpers.includes('"gitmemo"')) {
   await writeFile(searchHelpersPath, searchHelpers, "utf8");
   ok("search dispatch patched");
 }
+
+// Upstream's judge parser only accepts a single-key JSON object while its own
+// prompt asks for an explanation, which loses ~7% of instances. See the module.
+const { patchJudgeLabelParser } = await import("./patch-judge-label.mjs");
+const judgePatch = await patchJudgeLabelParser(join(omniDir, "scripts", "utils", "nlp_metrics.py"));
+if (judgePatch === "patched") ok("judge label parser patched (accepts the explanation form upstream's prompt asks for)");
+else if (judgePatch === "already-patched") ok("judge label parser already patched");
+else warn("judge label parser NOT patched — upstream's function changed; instances with a reasoned verdict will fail");
 
 // ── 4. dataset ──────────────────────────────────────────────────────────────
 step("LongMemEval dataset");

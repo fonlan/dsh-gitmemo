@@ -313,6 +313,18 @@ point for an agent that actually composes its memories. The gap between the two 
 headline result: for a keyword-grep memory, *what you commit to memory* matters more than the
 retrieval algorithm.
 
+### The end-to-end companion number
+
+The retrieval metrics above isolate the memory layer. The end-to-end QA run through
+[`../omnimemeval/`](../omnimemeval/README.md) — same benchmark, ingest → search → answer →
+LLM-judge — scores **0.7860** over all 500 instances, with `multi-session` weakest (0.6165),
+which is the *same* category this harness flags (0.554 `recall_all@5`). Two independent
+measurements agreeing is the useful part.
+
+It also shows why both layers are needed: `single-session-assistant` is the *best* end-to-end
+category (0.9464) while its session-level retrieval metrics are degenerate (51/56 instances
+gold-free). Measuring only retrieval would have written that category off.
+
 ### Reproducing the oracle ceiling
 
 `oracle` (gold-first) is a wiring check, not a result: with only 2–6 sessions per instance every

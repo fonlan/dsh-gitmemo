@@ -116,17 +116,20 @@ cd .omnimemeval && ./scripts/run_lme_eval.sh --lib gitmemo \
   --streaming 1 --start-idx 0 --end-idx 0 --to-step 2 --version smoke_gitmemo
 ```
 
-`setup.mjs` is idempotent and performs the four edits upstream requires for a new backend:
+`setup.mjs` is idempotent and performs the four registrations upstream requires for a new backend, plus one local bug-fix patch:
 
 1. symlinks `gitmemo_client.py` into the checkout's `scripts/client_factory/`;
 2. registers `"gitmemo" → GitMemoClient` in `client_factory/registry.py`;
 3. registers `"gitmemo": generic_text_search` in `utils/search_helpers.py`'s dispatch table
    (`client.search(query, user_id, top_k)` already matches the generic wrapper);
 4. symlinks the `longmemeval_s_cleaned.json` split already downloaded by the sibling harness, and
-   creates the venv.
+   creates the venv;
+5. patches `utils/nlp_metrics.py`'s judge-label parser, which otherwise discards 7.4 % of
+   instances — see §4.
 
-Both source patches are anchored to the lines upstream's own comment block names as the place to
-add a lib, and **fail loudly** rather than silently if the upstream layout has moved.
+The backend registrations are anchored to the lines upstream's own comment block names as the
+place to add a lib. Every step **fails loudly** rather than silently if the upstream layout has
+moved, and the judge patch additionally self-verifies that it landed verbatim.
 
 ### Dependency tiers
 
@@ -167,7 +170,78 @@ against already-ingested memories), `--start-idx/--end-idx` (slice the conversat
 
 ---
 
-## 4. Reading the output
+## 4. Results
+
+**Full `_S` split, streaming mode, 500/500 conversations, zero failures.** Step 1 (ingest +
+search) took 51 min; steps 3–5 took ~1 min. `TOPK=20`, `idf` ingestion, `plain` queries.
+
+| Metric | Value |
+| --- | --- |
+| **LLM-as-Judge (overall)** | **0.7860** |
+| Judge model | `deepseek-chat` (the API serves it as `deepseek-flash`) |
+| Answer model | `deepseek-chat` → `deepseek-flash` |
+| Context tokens (avg / question) | 19 030 |
+| Retrieved context (median / question) | 77 824 chars |
+| Search latency (avg / p95) | 370 ms / 720 ms |
+| Search status | 494 non-empty, 6 empty, 0 failed |
+
+By question type:
+
+| Category | LLM-Judge | Questions |
+| --- | --- | --- |
+| single-session-assistant | 0.9464 | 56 |
+| single-session-user | 0.8857 | 70 |
+| knowledge-update | 0.8333 | 78 |
+| temporal-reasoning | 0.8271 | 133 |
+| single-session-preference | 0.7000 | 30 |
+| multi-session | **0.6165** | 133 |
+
+```bash
+cd .omnimemeval && ./scripts/run_lme_eval.sh --lib gitmemo \
+  --env ~/.dsh-gitmemo-lme/.env.gitmemo --streaming 1 --llm-workers 12 --version gmf500
+```
+
+### What this says
+
+`multi-session` is the weak point, and it is the *same* weak point the retrieval harness finds
+(session-level `recall_all@5` 0.554 with `idf` ingestion, the lowest of any category): those 133
+questions need several sessions retrieved *together*, and gitmemo's recall returns a broad
+keyword-OR match whose ranking cannot guarantee that. The two independent measurements agreeing
+is the useful signal.
+
+**Cross-track finding: the official retrieval metric is degenerate exactly where end-to-end
+performance is best.** `single-session-assistant` scores 0.9464 here — the highest category —
+while the sibling harness reports its session-level retrieval metrics as meaningless because
+51 of its 56 instances are gold-free (the evidence is in *assistant* turns, and upstream's gold
+rule only accepts a flag on a *user* turn). The end-to-end pipeline succeeds anyway, because
+gitmemo stores the whole session transcript as the entry body, so once a hit is found the answer
+model can read the assistant's turn. A per-category retrieval table would have written that
+category off; measuring both layers shows why it must not be.
+
+**Read the number with its model attached.** Published LongMemEval figures are usually judged by
+GPT-4o; this run is judged by DeepSeek's flash tier, so 0.7860 is an internal, reproducible
+baseline to iterate against, not a leaderboard claim. The judge is part of the measurement.
+
+### The judge parser patch (and why it is here)
+
+Upstream `0b1ea8d` is internally inconsistent: `JUDGE_PROMPT` instructs the judge to *"provide a
+short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG"*, while
+`extract_label_json` accepts only the exact single-key form `{"label": "VALUE"}` and nothing else.
+So any judge reply that carries the explanation it was asked for is unparseable, and the whole
+instance fails: **37 of 500 (7.4%) were lost that way** before the patch, with `--skip-failed-judge
+0` aborting the run.
+
+`patch-judge-label.mjs` (applied automatically by `setup.mjs`, idempotent, self-verifying)
+accepts a strict **superset**: the original pattern first and unchanged, then a `"label"` key
+inside any JSON object, then the prose form the prompt itself asks for. It never reinterprets a
+verdict, and a genuinely unparseable reply still returns `None`, so real failures still surface.
+With it, `eval` status is `success=500`.
+
+> If you would rather not carry a local patch, re-run with `--skip-failed-judge 1` to get metrics
+> over 463 of 500 instances instead — upstream's own documented flag. The patched number is the
+> complete one; the decision is recorded here so either is defensible.
+
+## 5. Reading the output
 
 `results/lme/gitmemo-<version>/` contains the search contexts
 (`gitmemo_lme_search_results.json`), generated answers, judge verdicts and — after step 5 — the
@@ -183,7 +257,7 @@ Two things to keep in mind when interpreting it:
   published LongMemEval numbers are usually judged by GPT-4o, so scores are not strictly
   comparable across judge models. Record the judge with any number that is quoted.
 
-## 5. Known limitations
+## 6. Known limitations
 
 - **Per-conversation repos.** Ingesting all 500 conversations leaves 500 `.mem` repositories on
   disk (fine at `_S` scale; both this and the retry/rebuild cost matter at `_M` scale).

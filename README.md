@@ -215,6 +215,30 @@ npm run build    # tsc → lib/
 npm test         # build + engine/plugin/migration unit tests (node:test)
 ```
 
+## LongMemEval Evaluation
+
+The engine is benchmarked against [LongMemEval](https://github.com/xiaowu0162/LongMemEval) two
+ways, both runnable from this checkout. See [`evals/longmemeval/README.md`](evals/longmemeval/README.md)
+for the retrieval metrics and [`evals/omnimemeval/README.md`](evals/omnimemeval/README.md) for the
+end-to-end QA pipeline.
+
+```bash
+# official retrieval metrics (recall/NDCG, no LLM needed)
+npm run eval:lme:oracle                  # wiring check
+npm run eval:lme:s                       # all 500 instances of the _S split
+
+# end-to-end QA accuracy through OmniMemEval's 6-step pipeline
+npm run eval:omni:setup                  # clone + adapter + venv + env file
+cd .omnimemeval && ./scripts/run_lme_eval.sh --lib gitmemo \
+  --env ~/.dsh-gitmemo-lme/.env.gitmemo --streaming 1
+```
+
+Headline result on `_S` (500/500 instances, session granularity, zero failures): `recall_all@5`
+**0.736** against **0.870** for a plain BM25 over full session text, but `recall_all@50` **0.998** —
+the loss is ranking precision, not coverage. Holding everything else fixed and letting an LLM
+choose what to write raises `recall_all@5` to **0.842**, which is the point of the benchmark:
+for a keyword-grep memory, what you commit to memory dominates the retrieval algorithm.
+
 ## Layout
 
 ```
@@ -227,7 +251,10 @@ dsh-gitmemo/
 │   ├── migrate.ts        # legacy migration (dry-run/apply, backup refs, CAS swap)
 │   └── cli.ts            # `dsh-gitmemo migrate` CLI entry
 ├── lib/                  # built output (committed; used by file:/git installs)
-└── test/mem.test.mjs     # engine + plugin + migration unit tests
+├── test/mem.test.mjs     # engine + plugin + migration unit tests
+└── evals/
+    ├── longmemeval/      # retrieval harness: official recall/NDCG, no LLM required
+    └── omnimemeval/      # gitmemo as an OmniMemEval memory backend (QA accuracy)
 ```
 
 ## License
