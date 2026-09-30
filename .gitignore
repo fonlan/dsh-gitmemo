@@ -3,3 +3,12 @@ node_modules/
 *.log
 .DS_Store
 .mem/
+
+# LongMemEval eval harness — datasets, caches and run outputs stay local
+evals/longmemeval/data/
+evals/longmemeval/results/
+evals/longmemeval/.cache/
+evals/omnimemeval/.omnimemeval/
+.omnimemeval/
+evals/omnimemeval/.env.gitmemo
+evals/omnimemeval/*.local.env
