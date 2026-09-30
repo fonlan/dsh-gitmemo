@@ -126,13 +126,20 @@ the 5th of 6 user turns of a 1 562-character session, i.e. past the 400-characte
 window, and `degree` occurs exactly once.
 
 **Plain tf×idf ranking actively penalises single-mention facts.** Scoring the same session's
-terms by `tf × idf` puts `degree` at rank **23** of the keyword candidates: every term said
-twice outranks a distinctive term said once, and only 12 keywords fit. The fix is standard IR
-practice rather than benchmark tuning — saturate the term frequency
-(`idf × tf/(tf + k1)`, BM25-style) and pick the summary with an extractive scorer instead of
-truncating the opening. With both applied, the same session yields the keywords
-`administration, advice, apps, business, creating, definitely, degree, expenses, getting,
-graduated, helped, job` and the question retrieves correctly.
+terms by `tf × idf` puts `degree` at rank **23** of the keyword candidates: every term said twice
+outranks a distinctive term said once, and only 12 keywords fit. The fix is standard IR practice
+rather than benchmark tuning — saturate the term frequency (`idf × tf/(tf + k1)`, BM25-style) and
+pick the summary with an extractive scorer instead of truncating the opening. With both applied,
+the same session yields the keywords `administration, advice, apps, business, creating,
+definitely, degree, expenses, getting, graduated, helped, job` and the question retrieves
+correctly.
+
+To be precise about *why* saturation helps: it does **not** make any single-mention term beat any
+repeated one. It caps the multiplier repetition can earn at `k1 + 1 = 2.2`, so among low-frequency
+terms IDF decides instead of raw counts. That is enough here — `degree` at tf 1 with idf 3.58
+(3.58) overtakes terms at tf 2–3 with mid IDF (3.1–3.4) — and it is exactly the regime a memory
+index lives in, where most evidence is mentioned once. The two behaviours are pinned by unit
+tests (`test/harness.test.mjs`) so the claim cannot rot.
 
 This is the same conclusion LongMemEval's own paper draws at a larger scale: what a system
 *commits to memory* (`mem_write`'s title/summary/keywords) dominates what retrieval can later
@@ -191,6 +198,16 @@ Output: one JSON (all per-instance metrics and top-k rankings, for re-analysis) 
 Markdown report per run under `results/`. The Markdown report also carries upstream's
 `print_retrieval_metrics.py` lines verbatim, so a harness number can be diffed directly against
 a run of the official scripts.
+
+### Tests
+
+```bash
+node --test "evals/longmemeval/test/*.test.mjs"   # 28 hermetic unit tests, no network
+```
+
+They are also picked up by the repo's `npm test`. They cover the metric port's edge cases
+(including empty gold and the turn→session collapse), the official gold rule, the keyword/summary
+strategies, `.mem` entry → context formatting, and both ingest branches with a stubbed client.
 
 ### Correctness of the metrics
 
@@ -277,6 +294,7 @@ evals/longmemeval/
 │   ├── format.mjs        # .mem entry → clean context text
 │   ├── llm.mjs           # OpenAI-compatible client, disk-cached, concurrency-limited
 │   └── report.mjs        # JSON + Markdown reports
+├── test/harness.test.mjs # 28 unit tests (also run by `npm test`)
 ├── data/                 # datasets (git-ignored)
 └── results/              # run outputs (git-ignored)
 ```

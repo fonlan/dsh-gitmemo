@@ -80,9 +80,12 @@ export async function describeItem(item, { ingestMode, stats, client, maxKeyword
   // left untouched).
   const text = item.text && item.text.trim().length > 0 ? item.text : (item.fallbackText ?? "");
   item = { ...item, text };
+  // Imported once up front: the LLM branch below also needs sanitizeForEngine,
+  // and a `const` declared in the later branch would be in its temporal dead
+  // zone there.
+  const { titleize, summarize, extractiveSummary, ingestKeywords: extract, sanitizeForEngine } = await import("./text.mjs");
   if (ingestMode === "llm") {
     if (!client?.ready) throw new Error("ingest: --ingest-keywords llm requires an API key");
-    const { titleize, summarize, extractiveSummary } = await import("./text.mjs");
     const fallbackSummary = (summaryMode === "prefix" ? summarize(text) : extractiveSummary(text, stats)).trim() || "(empty session)";
     const prompt =
       "You are a coding agent recording a long-term memory entry for a past interaction.\n" +
@@ -101,10 +104,9 @@ export async function describeItem(item, { ingestMode, stats, client, maxKeyword
     return {
       title: sanitizeForEngine(String(raw.title ?? titleize(text)).replace(/[\r\n]+/g, " ")).slice(0, 200) || sanitizeForEngine(titleize(text)),
       summary: sanitizeForEngine(String(raw.summary ?? fallbackSummary).replace(/\s+/g, " ")).slice(0, 1000) || fallbackSummary,
-      keywords: keywords.length >= 2 ? keywords : (await import("./text.mjs")).ingestKeywords(text, stats, maxKeywords, { score: keywordScore })
+      keywords: keywords.length >= 2 ? keywords : extract(text, stats, maxKeywords, { score: keywordScore })
     };
   }
-  const { titleize, summarize, extractiveSummary, ingestKeywords: extract, sanitizeForEngine } = await import("./text.mjs");
   const summaryText = (summaryMode === "prefix" ? summarize(text) : extractiveSummary(text, stats)).trim();
   return {
     title: sanitizeForEngine(titleize(text)),
