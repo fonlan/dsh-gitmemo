@@ -274,6 +274,45 @@ prefix summary plus plain tf×idf ranking can retrieve *nothing* for a question 
 sits deep in a session. These numbers should therefore be read as a **lower bound for a
 keyword-grep memory**, with the `llm` ingestion policy as the realistic operating point.
 
+### Ablation: the ingestion policy is the dominant variable
+
+Same 40 instances (`--seed 7`), same queries (`plain`), same retriever, **only the memory-writing
+strategy changed**. 1 757 chat calls, zero failures.
+
+| `gitmemo` ingestion | r_any@5 | r_all@5 | ndcg@5 | r_all@10 | ndcg@10 | r_all@50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `idf` (deterministic heuristic) | 0.8158 | 0.6842 | 0.7000 | 0.8421 | 0.7488 | 1.0000 |
+| `llm` (an LLM writes each memory) | **0.9211** | **0.8421** | **0.8213** | **0.9211** | **0.8447** | 1.0000 |
+| `bm25` over full session text (reference, unchanged) | 0.9474 | 0.9474 | 0.8974 | 0.9474 | 0.8997 | 1.0000 |
+
+```bash
+node evals/longmemeval/run_retrieval.mjs --split s --seed 7 --limit 40 --retrievers gitmemo,bm25
+node evals/longmemeval/run_retrieval.mjs --split s --seed 7 --limit 40 --ingest-keywords llm --retrievers gitmemo,bm25
+```
+
+Changing **only how the memory is written** lifts `recall_all@5` from 0.684 to 0.842 (+23 %
+relative) and `ndcg@5` from 0.700 to 0.821, closing most of the gap to a BM25 index that sees
+every word of every session. The engine, the query side, the corpus and the metric are identical
+between the two rows. Per category, the gains land where retrieval must gather several pieces:
+
+| Question type | n | `idf` | `llm` |
+| --- | --- | --- | --- |
+| knowledge-update | 7 | 0.714 | **1.000** |
+| single-session-user | 5 | 0.600 | **1.000** |
+| multi-session | 8 | 0.625 | **0.875** |
+| temporal-reasoning | 15 | 0.667 | 0.667 |
+| single-session-preference | 2 | 1.000 | 1.000 |
+
+`temporal-reasoning` is the exception: it does not improve with better keyword selection, which is
+consistent with gitmemo's recall having no notion of time — the store records a date in the entry
+body and front matter, but the *query* cannot filter or weight by it. That is a concrete,
+actionable gap, and it is the one upstream's paper addresses with time-aware query expansion.
+
+**Read the default numbers above as a lower bound**; the `llm` row is the realistic operating
+point for an agent that actually composes its memories. The gap between the two rows is the
+headline result: for a keyword-grep memory, *what you commit to memory* matters more than the
+retrieval algorithm.
+
 ### Reproducing the oracle ceiling
 
 `oracle` (gold-first) is a wiring check, not a result: with only 2–6 sessions per instance every
