@@ -23,7 +23,7 @@
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { GitMemo, GitMemoError, resolveProjectRoot, type GitMemoConfig, type SearchOutput, type SearchScoring } from "./mem.js";
-import { evaluateGate, type GateCandidate, type GateDecision, type GateOptions, type SystemOneMode } from "./systemone.js";
+import { evaluateGate, type GateCandidate, type GateDecision, type GateOptions, type GatePolicy, type SystemOneMode } from "./systemone.js";
 
 /** Cordis plugin name. */
 const name = "dsh-gitmemo";
@@ -95,6 +95,25 @@ const Config = z.object({
     scoreMin: z.number().default(2).volatile(),
     /** Retain at least this many candidates when the model rejects an entire page. */
     minKeep: z.number().step(1).min(0).default(1).volatile(),
+    /**
+     * What happens to a judged candidate.
+     *
+     * `rerank` (default) keeps every candidate and lets the judge's value order
+     * the page; `filter` drops those below the threshold, bounded by
+     * `maxDropFraction`. Measured end-to-end on LongMemEval `_S` with the same
+     * judge and the same per-candidate values: filtering at the default
+     * threshold scored 0.3800, ordering scored 0.8020. The judge's AUC is
+     * ~0.71-0.75, so no threshold is safe, but the ordering is useful. See
+     * evals/longmemeval/README.md.
+     */
+    policy: z.union(["rerank", "filter"]).default("rerank").volatile(),
+    /**
+     * `filter` policy only: never drop more than this share of the judged page,
+     * lowest-scoring first. Caps the damage a mis-calibrated threshold can do —
+     * a memory dropped is gone, a memory kept only costs context. The offline
+     * sweep held recall_all@5 at 0.8875 with a 20 % cap against 0.6875 uncapped.
+     */
+    maxDropFraction: z.number().min(0).max(1).default(0.25).volatile(),
     /** Never judge more than this many candidates per request. */
     maxCandidates: z.number().step(1).min(1).default(20).volatile(),
     /** Truncate the task text to this many characters before sending it. */
@@ -113,6 +132,8 @@ interface SystemOneConfig {
   threshold: number;
   scoreMin: number;
   minKeep: number;
+  policy: GatePolicy;
+  maxDropFraction: number;
   maxCandidates: number;
   maxTaskChars: number;
   timeoutMs: number;
@@ -139,6 +160,10 @@ interface ResolvedConfig {
 /** Machine-visible summary of one gate decision, attached to the search output. */
 interface GatedSearchOutput extends SearchOutput {
   gated?: {
+    /** Whether the judge's values were used to order the page or to drop from it. */
+    policy: GatePolicy;
+    /** True when `maxDropFraction` restored candidates a threshold would have removed. */
+    bounded?: true;
     mode: SystemOneMode;
     model: string;
     /** Size of the candidate page the gate was handed. */
@@ -195,6 +220,8 @@ function readSystemOne(config: unknown): SystemOneConfig {
     threshold: liveValue<number>(section.threshold, 0.5),
     scoreMin: liveValue<number>(section.scoreMin, 2),
     minKeep: liveValue<number>(section.minKeep, 1),
+    policy: liveValue<string>(section.policy, "rerank") === "filter" ? "filter" : "rerank",
+    maxDropFraction: liveValue<number>(section.maxDropFraction, 0.25),
     maxCandidates: liveValue<number>(section.maxCandidates, 20),
     maxTaskChars: liveValue<number>(section.maxTaskChars, 2000),
     timeoutMs: liveValue<number>(section.timeoutMs, 8000),
@@ -561,8 +588,10 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
           " candidates=" + candidates.length +
           " judged=" + decision.judged +
           (decision.untouched === 0 ? "" : " untouched=" + decision.untouched) +
+          " policy=" + decision.policy +
           " kept=" + decision.kept.length +
           " dropped=" + decision.dropped.length +
+          (decision.bounded ? " bounded=yes" : "") +
           (decision.reason === undefined ? "" : " reason=" + decision.reason) +
           (decision.usage?.inputTokens === undefined ? "" : " input_tokens=" + decision.usage.inputTokens) +
           " verdicts=" +
@@ -572,10 +601,21 @@ function registerMemTools(ctx: { tools: { register(tool: unknown): unknown } }, 
       );
 
       const kept = new Set(decision.kept);
+      // `rerank` reorders the page by the judge's value and drops nothing;
+      // `filter` keeps the shipped behaviour, already bounded by
+      // `maxDropFraction` inside `decide`. Both preserve page order for
+      // everything the gate left alone.
+      const surviving = result.results.filter((hit) => kept.has(hit.hash));
+      const reranked =
+        decision.policy === "rerank"
+          ? [...surviving].sort((a, b) => decision.ordered.indexOf(a.hash) - decision.ordered.indexOf(b.hash))
+          : surviving;
       return {
         ...result,
-        results: result.results.filter((hit) => kept.has(hit.hash)),
+        results: reranked,
         gated: {
+          policy: decision.policy,
+          ...(decision.bounded ? { bounded: true } : {}),
           mode: decision.mode,
           model: decision.model,
           candidates: candidates.length,
@@ -982,6 +1022,8 @@ async function apply(
         threshold: section.threshold,
         scoreMin: section.scoreMin,
         minKeep: section.minKeep,
+        policy: section.policy,
+        maxDropFraction: section.maxDropFraction,
         maxCandidates: section.maxCandidates,
         maxTaskChars: section.maxTaskChars,
         timeoutMs: section.timeoutMs,

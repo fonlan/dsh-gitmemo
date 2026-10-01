@@ -57,6 +57,15 @@ export interface GateOptions {
   scoreMin: number;
   /** Retain at least this many candidates when the model rejects the whole page. */
   minKeep: number;
+  /** What the caller does with the values; see {@link GatePolicy}. */
+  policy?: GatePolicy;
+  /**
+   * `filter` policy only: never drop more than this fraction of the judged page,
+   * lowest-scoring first. Bounds the damage a mis-calibrated threshold can do —
+   * an offline sweep kept recall_all@5 at 0.8875 with a 20 % cap, against 0.6875
+   * uncapped. Default 0.25.
+   */
+  maxDropFraction?: number;
   /** Never send more than this many candidates in one request. */
   maxCandidates: number;
   /** Truncate the task text to this many characters. */
@@ -102,6 +111,16 @@ export interface GateDecision {
   dropped: string[];
   /** Per-candidate verdicts, in candidate order. */
   verdicts: GateVerdict[];
+  /** Policy actually applied; see {@link GatePolicy}. */
+  policy: GatePolicy;
+  /** True when `maxDropFraction` restored candidates a threshold would have removed. */
+  bounded: boolean;
+  /**
+   * Candidate hashes ordered by the judge's value, best first (nulls last and
+   * kept stable). This is what the `rerank` policy applies; in `filter` mode it
+   * is still reported so a caller can log or inspect the judge's ordering.
+   */
+  ordered: string[];
   /** Question type actually used. */
   mode: SystemOneMode;
   /** Model identifier the request named. */
@@ -160,6 +179,25 @@ export const NOUL_CRITERIA = {
 /** The judgement asked of the model in `score` mode. */
 export const SCORE_INSTRUCTION =
   "How relevant is the `candidate` memory record to the `task`? Rate how reusable its conclusions, decisions, constraints, or findings are for this exact task.";
+
+/**
+ * What the caller does with the judge's values.
+ *
+ * - `rerank` (default): keep every judged candidate and let the values reorder
+ *   the page. Cannot lose a memory by construction.
+ * - `filter`: drop candidates below the threshold, then apply `maxDropFraction`.
+ *
+ * Measured on LongMemEval `_S` (500 questions, identical ingested memories): at
+ * threshold 0.5 the filter held 343 gold memories out of the prompt across 254
+ * instances and took LLM-as-Judge from 0.7840 to 0.3800, while the same values
+ * used as a reranker scored 0.8020 on the same context. The judge's AUC is only
+ * ~0.71-0.75, so no threshold can make a hard drop safe; the same signal is a
+ * fine ordering feature. See evals/longmemeval/README.md.
+ */
+export type GatePolicy = "rerank" | "filter";
+
+/** Accepted `policy` values, for config validation and tool schemas. */
+export const GATE_POLICIES: readonly GatePolicy[] = ["rerank", "filter"];
 
 /** Trim a candidate summary before it is sent to the model. */
 function clamp(text: string, limit: number): string {
@@ -275,9 +313,31 @@ export function parseUsage(payload: unknown): GateUsage | undefined {
 export function decide(
   candidates: readonly GateCandidate[],
   values: ReadonlyArray<number | undefined>,
-  options: Pick<GateOptions, "mode" | "threshold" | "scoreMin" | "minKeep">
-): { kept: string[]; dropped: string[]; verdicts: GateVerdict[]; floored: boolean } {
+  options: Pick<GateOptions, "mode" | "threshold" | "scoreMin" | "minKeep" | "policy" | "maxDropFraction">
+): { kept: string[]; dropped: string[]; verdicts: GateVerdict[]; floored: boolean; bounded: boolean } {
+  // `decide` is the low-level primitive: with no explicit policy it applies the
+  // literal threshold semantics, and with no explicit bound it applies none. The
+  // product policy (rerank by default, 25 % drop cap) lives in the config layer,
+  // which passes both in explicitly — the same split as `minKeep`.
+  const policy: GatePolicy = options.policy ?? "filter";
   const cutoff = options.mode === "noul" ? options.threshold : options.scoreMin;
+  if (policy === "rerank") {
+    // Reordering cannot lose a memory: report every judged candidate as kept and
+    // let `ordered` carry the ranking. The threshold verdict is still visible in
+    // each verdict's `value`.
+    const all = candidates.map((candidate, index) => ({
+      hash: candidate.hash,
+      value: values[index] ?? null,
+      keep: true
+    }));
+    return {
+      kept: candidates.map((c) => c.hash),
+      dropped: [],
+      verdicts: all,
+      floored: false,
+      bounded: false
+    };
+  }
   const verdicts: GateVerdict[] = candidates.map((candidate, index) => {
     const value = values[index];
     if (value === undefined) return { hash: candidate.hash, value: null, keep: true };
@@ -303,12 +363,40 @@ export function decide(
     floored = true;
   }
 
+  // Bound the damage: a threshold that rejects most of a page is far more
+  // likely to be mis-calibrated than the page is to be mostly irrelevant, and
+  // the cost of the two errors is not symmetric — a dropped memory is gone,
+  // a kept one only costs context. Restore the best-scoring rejects until the
+  // drop share is within `maxDropFraction`.
+  let bounded = false;
+  const maxDropFraction = options.maxDropFraction ?? 1;
+  if (candidates.length > 0 && maxDropFraction < 1) {
+    const allowedDrops = Math.max(0, Math.floor(candidates.length * Math.max(0, maxDropFraction)));
+    const dropCount = candidates.length - kept.length;
+    if (dropCount > allowedDrops) {
+      const restoreCount = dropCount - allowedDrops;
+      const rejects = verdicts
+        .map((verdict, index) => ({ verdict, index }))
+        .filter((entry) => !entry.verdict.keep)
+        .sort((a, b) => {
+          const av = a.verdict.value ?? Number.NEGATIVE_INFINITY;
+          const bv = b.verdict.value ?? Number.NEGATIVE_INFINITY;
+          return bv - av || a.index - b.index;
+        })
+        .slice(0, restoreCount);
+      for (const entry of rejects) entry.verdict.keep = true;
+      kept = verdicts.filter((v) => v.keep).map((v) => v.hash);
+      bounded = true;
+    }
+  }
+
   const keptSet = new Set(kept);
   return {
     kept,
     dropped: candidates.map((c) => c.hash).filter((hash) => !keptSet.has(hash)),
     verdicts,
-    floored
+    floored,
+    bounded
   };
 }
 
@@ -337,13 +425,16 @@ export async function evaluateGate(
   signal?: AbortSignal
 ): Promise<GateDecision> {
   const mode = options.mode;
+  const policy: GatePolicy = options.policy ?? "rerank";
   const base = {
     mode,
-    model: options.model
+    model: options.model,
+    policy,
+    bounded: false
   };
 
   if (candidates.length === 0) {
-    return { ...base, kept: [], dropped: [], verdicts: [], judged: 0, untouched: 0, degraded: false };
+    return { ...base, kept: [], dropped: [], verdicts: [], ordered: [], judged: 0, untouched: 0, degraded: false };
   }
 
   const judged = candidates.slice(0, Math.max(1, options.maxCandidates));
@@ -353,6 +444,7 @@ export async function evaluateGate(
     kept: candidates.map((c) => c.hash),
     dropped: [],
     verdicts: candidates.map((c) => ({ hash: c.hash, value: null, keep: true })),
+    ordered: candidates.map((c) => c.hash),
     judged: judged.length,
     untouched: untouched.length,
     degraded: true,
@@ -394,24 +486,41 @@ export async function evaluateGate(
   }
 
   const values = parseAnswers(payload, mode, judged.length);
-  const decision = decide(judged, values, options);
+  const decision = decide(judged, values, { ...options, policy });
   // Candidates past `maxCandidates` were never evaluated, so they are never
   // removed: the gate may only drop what it actually judged. Leaving them out
   // of the kept set would silently truncate every page larger than the cap.
   const keptSet = new Set([...decision.kept, ...untouched.map((c) => c.hash)]);
+  const verdicts: GateVerdict[] = [
+    ...decision.verdicts,
+    ...untouched.map((c) => ({ hash: c.hash, value: null, keep: true }))
+  ];
+  // Best value first; nulls (unjudged / unreadable) keep page order at the end.
+  const ordered = candidates
+    .map((candidate, index) => ({ candidate, index, value: verdicts[index]?.value ?? null }))
+    .sort((a, b) => {
+      if (a.value === b.value) return a.index - b.index;
+      if (a.value === null) return 1;
+      if (b.value === null) return -1;
+      return b.value - a.value;
+    })
+    .map((entry) => entry.candidate.hash);
   const usage = parseUsage(payload);
   return {
     ...base,
+    ordered,
+    bounded: decision.bounded,
     kept: [...candidates.map((c) => c.hash).filter((hash) => keptSet.has(hash))],
     dropped: decision.dropped,
-    verdicts: [
-      ...decision.verdicts,
-      ...untouched.map((c) => ({ hash: c.hash, value: null, keep: true }))
-    ],
+    verdicts,
     judged: judged.length,
     untouched: untouched.length,
     degraded: false,
     ...(usage === undefined ? {} : { usage }),
-    ...(decision.floored ? { reason: "no candidate scored above the threshold; retained top " + decision.kept.length } : {})
+    ...(decision.floored
+      ? { reason: "no candidate scored above the threshold; retained top " + decision.kept.length }
+      : decision.bounded
+        ? { reason: "threshold would have dropped more than maxDropFraction; restored the best-scoring rejects" }
+        : {})
   };
 }

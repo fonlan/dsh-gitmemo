@@ -90,6 +90,25 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
         scoreMin: z<number, number, "volatile-defined">;
         /** Retain at least this many candidates when the model rejects an entire page. */
         minKeep: z<number, number, "volatile-defined">;
+        /**
+         * What happens to a judged candidate.
+         *
+         * `rerank` (default) keeps every candidate and lets the judge's value order
+         * the page; `filter` drops those below the threshold, bounded by
+         * `maxDropFraction`. Measured end-to-end on LongMemEval `_S` with the same
+         * judge and the same per-candidate values: filtering at the default
+         * threshold scored 0.3800, ordering scored 0.8020. The judge's AUC is
+         * ~0.71-0.75, so no threshold is safe, but the ordering is useful. See
+         * evals/longmemeval/README.md.
+         */
+        policy: z<"filter" | "rerank", "filter" | "rerank", "volatile-defined">;
+        /**
+         * `filter` policy only: never drop more than this share of the judged page,
+         * lowest-scoring first. Caps the damage a mis-calibrated threshold can do —
+         * a memory dropped is gone, a memory kept only costs context. The offline
+         * sweep held recall_all@5 at 0.8875 with a 20 % cap against 0.6875 uncapped.
+         */
+        maxDropFraction: z<number, number, "volatile-defined">;
         /** Never judge more than this many candidates per request. */
         maxCandidates: z<number, number, "volatile-defined">;
         /** Truncate the task text to this many characters before sending it. */
@@ -117,6 +136,25 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
         scoreMin: z<number, number, "volatile-defined">;
         /** Retain at least this many candidates when the model rejects an entire page. */
         minKeep: z<number, number, "volatile-defined">;
+        /**
+         * What happens to a judged candidate.
+         *
+         * `rerank` (default) keeps every candidate and lets the judge's value order
+         * the page; `filter` drops those below the threshold, bounded by
+         * `maxDropFraction`. Measured end-to-end on LongMemEval `_S` with the same
+         * judge and the same per-candidate values: filtering at the default
+         * threshold scored 0.3800, ordering scored 0.8020. The judge's AUC is
+         * ~0.71-0.75, so no threshold is safe, but the ordering is useful. See
+         * evals/longmemeval/README.md.
+         */
+        policy: z<"filter" | "rerank", "filter" | "rerank", "volatile-defined">;
+        /**
+         * `filter` policy only: never drop more than this share of the judged page,
+         * lowest-scoring first. Caps the damage a mis-calibrated threshold can do —
+         * a memory dropped is gone, a memory kept only costs context. The offline
+         * sweep held recall_all@5 at 0.8875 with a 20 % cap against 0.6875 uncapped.
+         */
+        maxDropFraction: z<number, number, "volatile-defined">;
         /** Never judge more than this many candidates per request. */
         maxCandidates: z<number, number, "volatile-defined">;
         /** Truncate the task text to this many characters before sending it. */
@@ -187,6 +225,25 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
         scoreMin: z<number, number, "volatile-defined">;
         /** Retain at least this many candidates when the model rejects an entire page. */
         minKeep: z<number, number, "volatile-defined">;
+        /**
+         * What happens to a judged candidate.
+         *
+         * `rerank` (default) keeps every candidate and lets the judge's value order
+         * the page; `filter` drops those below the threshold, bounded by
+         * `maxDropFraction`. Measured end-to-end on LongMemEval `_S` with the same
+         * judge and the same per-candidate values: filtering at the default
+         * threshold scored 0.3800, ordering scored 0.8020. The judge's AUC is
+         * ~0.71-0.75, so no threshold is safe, but the ordering is useful. See
+         * evals/longmemeval/README.md.
+         */
+        policy: z<"filter" | "rerank", "filter" | "rerank", "volatile-defined">;
+        /**
+         * `filter` policy only: never drop more than this share of the judged page,
+         * lowest-scoring first. Caps the damage a mis-calibrated threshold can do —
+         * a memory dropped is gone, a memory kept only costs context. The offline
+         * sweep held recall_all@5 at 0.8875 with a 20 % cap against 0.6875 uncapped.
+         */
+        maxDropFraction: z<number, number, "volatile-defined">;
         /** Never judge more than this many candidates per request. */
         maxCandidates: z<number, number, "volatile-defined">;
         /** Truncate the task text to this many characters before sending it. */
@@ -214,6 +271,25 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
         scoreMin: z<number, number, "volatile-defined">;
         /** Retain at least this many candidates when the model rejects an entire page. */
         minKeep: z<number, number, "volatile-defined">;
+        /**
+         * What happens to a judged candidate.
+         *
+         * `rerank` (default) keeps every candidate and lets the judge's value order
+         * the page; `filter` drops those below the threshold, bounded by
+         * `maxDropFraction`. Measured end-to-end on LongMemEval `_S` with the same
+         * judge and the same per-candidate values: filtering at the default
+         * threshold scored 0.3800, ordering scored 0.8020. The judge's AUC is
+         * ~0.71-0.75, so no threshold is safe, but the ordering is useful. See
+         * evals/longmemeval/README.md.
+         */
+        policy: z<"filter" | "rerank", "filter" | "rerank", "volatile-defined">;
+        /**
+         * `filter` policy only: never drop more than this share of the judged page,
+         * lowest-scoring first. Caps the damage a mis-calibrated threshold can do —
+         * a memory dropped is gone, a memory kept only costs context. The offline
+         * sweep held recall_all@5 at 0.8875 with a 20 % cap against 0.6875 uncapped.
+         */
+        maxDropFraction: z<number, number, "volatile-defined">;
         /** Never judge more than this many candidates per request. */
         maxCandidates: z<number, number, "volatile-defined">;
         /** Truncate the task text to this many characters before sending it. */

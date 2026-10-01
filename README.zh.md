@@ -69,7 +69,9 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
       endpoint: https://api.typesafe.ai/v1/systemone
       model: jev-latest
       mode: noul           # noul | score
-      threshold: 0.5       # noul 模式：概率 ≥ 该值才保留
+      policy: rerank       # rerank（默认）| filter —— 见「System-one 召回门控」
+      threshold: 0.5       # filter 模式：概率 < 该值则丢弃
+      maxDropFraction: 0.25  # filter 模式：单页最多丢弃此比例
 ```
 
 ## 检索评分
@@ -86,6 +88,17 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
 **为什么把它设为默认。** 在 LongMemEval `_S`（500 个实例、会话粒度）上，引擎的 `recall_all@50` 达到 0.998，而 `ndcg_any@5` 只有 0.686：证据基本都能召回，但排不上来——因为纯命中计数分不清罕见词与随处可见的词。在完全相同的入库数据上只改加权，`recall_all@5` 从 0.738 升到 0.755、`ndcg@5` 从 0.687 升到 0.700，而 `recall_all@50` 仍是 0.998（匹配逻辑在构造上未改动）。完整实验与「打分 / 粒度 / 写入策略」三组消融见 `evals/longmemeval/README.md`。
 
 ## System-one 召回门控（可选）
+
+**判定结果怎么用 —— `policy`：**
+
+| `policy` | 作用 | 上下文 | 实测准确率 |
+| --- | --- | --- | --- |
+| `rerank`（默认） | 保留全部被判定的记忆，只按判定分值重排本页 | 不变 | **0.8020** |
+| `filter` | 丢弃低于 `threshold` 的记忆，并由 `maxDropFraction` 兜住上限 | **−80 %** | **0.3800** |
+
+以上是 LongMemEval `_S` 全部 500 题、同一个 judge、同一批已入库记忆、同一组候选分值下的 LLM-as-Judge 结果——**唯一的差别就是怎么用这些分值**。原因在信号本身：judge 区分证据与非证据的 AUC 只有约 0.71–0.75，因此**没有任何阈值是安全的**，但同一个分值作为排序特征是可靠的。在 0.75 AUC 的信号上做硬删，把 343 条 gold 记忆挡在了提示之外，涉及 500 个实例中的 254 个。
+
+`filter` 仍然保留：当上下文预算才是硬约束时，「丢弃」正是召回门控的意义所在。而它现在**有上限**了：`maxDropFraction`（默认 0.25）会在阈值想丢掉超过该比例时，把得分最高的被拒候选恢复回来。离线扫描显示 20% 上限能把 `recall_all@5` 稳在 0.8875，而不设上限只有 0.6875。丢掉的记忆就没了，留下的只是多花点上下文——两类错误并不对称，所以上限刻意收得紧。
 
 `mem_search` 的候选页可以交给一个 **System-one 模型**（默认 [TypeSafe Jev](https://docs.typesafe.ai)）
 做一次快速判断，把与当前任务**完全无关**的记忆从注入内容里剔除，只留下真正可复用的条目。
@@ -117,6 +130,8 @@ bundle patch 自带合理默认值，可在 profile 的 `cordis.patch.yml` 中�
 | `threshold` | `0.5` | `noul` 模式：概率 ≥ 该值保留 |
 | `scoreMin` | `2` | `score` 模式阈值。注意 Jev 的 `score` 是 `Σ(层级序号 × 概率)`，范围是 0…层级数−1（默认 5 层 → 0…4），**不是 0–1** |
 | `minKeep` | `1` | 整页被拒时至少保留几条 |
+| `policy` | `rerank` | `rerank` 保留全部判定过的记忆并按分值重排；`filter` 丢弃低于 `threshold` 的候选 |
+| `maxDropFraction` | `0.25` | 仅 `filter`：单页最多丢弃此比例，从最低分开始丢 |
 | `maxCandidates` | `20` | 单次请求最多判定多少条；超出部分**不判定、不剔除** |
 | `maxTaskChars` | `2000` | 任务文本截断长度 |
 | `timeoutMs` | `8000` | 请求超时 |

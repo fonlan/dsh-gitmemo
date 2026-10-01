@@ -71,7 +71,9 @@ The bundle patch ships with sensible defaults; override them in the profile's
       endpoint: https://api.typesafe.ai/v1/systemone
       model: jev-latest
       mode: noul           # noul | score
-      threshold: 0.5       # noul mode: keep a candidate when P(yes) >= this
+      policy: rerank       # rerank (default) | filter — see "System-one Recall Gate"
+      threshold: 0.5       # filter mode: drop a candidate when P(yes) < this
+      maxDropFraction: 0.25  # filter mode: never drop more than this share of a page
 ```
 
 ## Search Scoring
@@ -104,8 +106,30 @@ granularity and ingestion policy.
 
 A `mem_search` page can be handed to a **System-one model** (TypeSafe Jev by
 default) for one fast judgement, so memories that are **completely unrelated**
-to the current task are dropped before they are injected. Only genuinely
-reusable entries survive.
+to the current task do not get injected.
+
+**How the judgement is used — `policy`:**
+
+| `policy` | Effect | Context | Measured accuracy |
+| --- | --- | --- | --- |
+| `rerank` (default) | keeps every judged memory and orders the page by the judge's value | unchanged | **0.8020** |
+| `filter` | drops memories below `threshold`, bounded by `maxDropFraction` | **−80 %** | **0.3800** |
+
+Those two figures are LongMemEval `_S` LLM-as-Judge over all 500 questions, with
+the same judge, the same ingested memories and the same per-candidate values —
+only the use made of them differs. The reason is in the judge's own signal: its
+AUC separating evidence from non-evidence is ~0.71–0.75, so **no threshold is
+safe**, while the same value is a perfectly good ordering feature. A hard drop on
+a 0.75-AUC signal took 343 gold memories out of the prompt across 254 of 500
+instances. Full study: `evals/longmemeval/README.md`.
+
+`filter` remains available because dropping memories is the point of a recall
+gate when context budget is the binding constraint — and it is now **bounded**:
+`maxDropFraction` (default 0.25) restores the best-scoring rejects whenever a
+threshold would drop more than that share of a page. An offline sweep held
+`recall_all@5` at 0.8875 with a 20 % cap against 0.6875 uncapped. A memory
+dropped is gone; a memory kept only costs context, so the errors are not
+symmetric and the bound is deliberately tight.
 
 - **Inert by default.** The gate runs only when a usable credential is
   configured (`apiKey`, the credential named by `apiKeyEnv`, or the environment
@@ -114,9 +138,15 @@ reusable entries survive.
 - **Fails open.** A timeout, a non-2xx response, an unparseable body — any
   failure keeps every candidate and reports why in `gated.degraded` +
   `gated.reason`. **A broken endpoint can never hide a memory.**
-- **Never empties a page.** If the model rejects the whole page, at least
-  `minKeep` (default 1) best-ranked candidates are retained, so "the gate removed
-  it" and "there was nothing there" stay distinguishable. The tool's `gated` line
+- **Never empties a page.** Under `filter`, at least `minKeep` (default 1)
+  best-ranked candidates are retained when the whole page is rejected, and
+  `maxDropFraction` (default 0.25) caps how much of a judged page may be removed
+  at all — so "the gate removed it" and "there was nothing there" stay
+  distinguishable, and a mis-calibrated threshold cannot gut a page. Under
+  `rerank` nothing is removed by construction.
+- **Ordering is reported either way.** The decision carries `ordered` (candidate
+  hashes best-first by the judge's value) and each verdict's value, so a caller
+  can log or re-rank from the same judgement without a second call. The tool's `gated` line
   says so out loud — such a page carries a `NOTE(no candidate scored above the
   threshold…)` marker, so a retained floor is never mistaken for a candidate that
   genuinely passed. `judged=` counts only the candidates actually sent to the
@@ -141,6 +171,8 @@ reusable entries survive.
 | `mode` | `noul` | `noul` (yes/no probability) or `score` (graded levels) |
 | `threshold` | `0.5` | `noul` mode: keep when P(yes) ≥ this |
 | `scoreMin` | `2` | `score` mode cutoff. Note Jev's `score` is `Σ(level_index × probability)`, ranging 0…levels−1 (5 levels → 0…4), **not 0–1** |
+| `policy` | `rerank` | `rerank` keeps every judged memory and orders the page by the judge's value; `filter` drops below `threshold` |
+| `maxDropFraction` | `0.25` | `filter` only: never drop more than this share of the judged page, lowest-scoring first |
 | `minKeep` | `1` | Candidates retained when the whole page is rejected |
 | `maxCandidates` | `20` | Candidates judged per request; the remainder is **never judged and never dropped** |
 | `maxTaskChars` | `2000` | Task-text truncation length |

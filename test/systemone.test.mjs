@@ -166,7 +166,8 @@ test("decide never empties a page when minKeep is 0 and nothing passes", () => {
 
 test("evaluateGate drops the irrelevant candidates and reports usage", async () => {
   const fetchImpl = fetchStub([0.95, 0.05, 0.8]);
-  const decision = await evaluateGate("task", candidates(3), options({ fetchImpl }));
+  // Explicit: the shipped default is now `rerank`, which drops nothing.
+  const decision = await evaluateGate("task", candidates(3), options({ fetchImpl, policy: "filter", maxDropFraction: 1 }));
   assert.equal(decision.degraded, false);
   assert.equal(decision.kept.length, 2);
   assert.deepEqual(decision.dropped, [candidates(3)[1].hash]);
@@ -229,7 +230,7 @@ test("evaluateGate never drops candidates it did not judge, even when all judged
   const fetchImpl = fetchStub([0.1, 0.1]);
   const all = candidates(4);
   // minKeep 0 so the floor cannot mask whether the untouched tail survived.
-  const decision = await evaluateGate("task", all, options({ fetchImpl, maxCandidates: 2, minKeep: 0 }));
+  const decision = await evaluateGate("task", all, options({ fetchImpl, maxCandidates: 2, minKeep: 0, policy: "filter", maxDropFraction: 1 }));
   assert.equal(decision.judged, 2);
   assert.equal(decision.untouched, 2);
   assert.deepEqual(decision.kept, [all[2].hash, all[3].hash], "unjudged candidates must survive untouched");
@@ -241,9 +242,12 @@ test("evaluateGate returns no decision work for an empty page", async () => {
   assert.deepEqual(decision, {
     mode: "noul",
     model: "jev-latest",
+    policy: "rerank",
+    bounded: false,
     kept: [],
     dropped: [],
     verdicts: [],
+    ordered: [],
     judged: 0,
     untouched: 0,
     degraded: false
@@ -327,7 +331,9 @@ test("mem_search applies the gate when a key is configured, and stays JSON-lossl
   try {
     const tools = await pluginTools({
       projectRoot: root,
-      systemOne: { enabled: true, endpoint: "https://example.test/v1/systemone", model: "jev-latest", mode: "noul", threshold: 0.5, minKeep: 1, apiKey: "test-key" }
+      // Pinned to `filter`: the shipped default is now `rerank`, which drops
+      // nothing. The reranker's product behaviour has its own test below.
+      systemOne: { enabled: true, endpoint: "https://example.test/v1/systemone", model: "jev-latest", mode: "noul", threshold: 0.5, minKeep: 1, policy: "filter", maxDropFraction: 1, apiKey: "test-key" }
     });
     const exec = { agent: { session: { header: { cwd: root } } } };
     const first = await tools.mem_write.execute(
@@ -389,6 +395,10 @@ test("the rendered gated line names a floored page and reports the unjudged tail
         threshold: 0.5,
         minKeep: 1,
         maxCandidates: 1,
+        // Explicit: the shipped default is `rerank`, and this test is about the
+        // filtering path's flooring and untouched-tail reporting.
+        policy: "filter",
+        maxDropFraction: 1,
         apiKey: "test-key"
       }
     });
@@ -496,5 +506,162 @@ test("systemOne.enabled:false disables the gate even with a key present", async 
     assert.equal(Object.hasOwn(result, "gated"), false);
   } finally {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// policy: rerank is the default; filter is bounded
+// ---------------------------------------------------------------------------
+
+test("the default policy is rerank: nothing is dropped and `ordered` carries the ranking", async () => {
+  const fetchImpl = fetchStub([0.2, 0.9, 0.5]);
+  const all = candidates(3);
+  const decision = await evaluateGate("task", all, options({ fetchImpl }));
+  assert.equal(decision.policy, "rerank");
+  assert.deepEqual(decision.dropped, [], "rerank must not drop a memory");
+  assert.deepEqual(decision.kept, all.map((c) => c.hash));
+  assert.deepEqual(decision.ordered, [all[1].hash, all[2].hash, all[0].hash], "best value first");
+  assert.deepEqual(
+    decision.verdicts.map((v) => v.value),
+    [0.2, 0.9, 0.5],
+    "verdicts stay in candidate order with their values"
+  );
+});
+
+test("rerank puts unreadable values last rather than first", async () => {
+  const fetchImpl = fetchStub([0.4, undefined, 0.8]);
+  const all = candidates(3);
+  const decision = await evaluateGate("task", all, options({ fetchImpl }));
+  assert.equal(decision.ordered[0], all[2].hash);
+  assert.equal(decision.ordered[2], all[1].hash, "a null value must not outrank a judged one");
+});
+
+test("filter is bounded by maxDropFraction: a mis-calibrated threshold cannot gut a page", async () => {
+  // Every candidate scores below the threshold, so a pure filter would drop all
+  // of them. The bound must restore the best-scoring share.
+  const fetchImpl = fetchStub([0.1, 0.2, 0.3, 0.4]);
+  const all = candidates(4);
+  const decision = await evaluateGate("task", all, options({
+    fetchImpl,
+    policy: "filter",
+    minKeep: 0,
+    maxDropFraction: 0.25
+  }));
+  assert.equal(decision.bounded, true);
+  assert.equal(decision.dropped.length, 1, "at most 25% of 4 candidates may be dropped");
+  assert.equal(decision.kept.length, 3);
+  assert.deepEqual(decision.dropped, [all[0].hash], "the lowest-scoring candidate is the one dropped");
+  assert.match(decision.reason, /maxDropFraction/);
+});
+
+test("maxDropFraction: 1 restores unbounded filtering for callers who want it", async () => {
+  const fetchImpl = fetchStub([0.1, 0.2, 0.3]);
+  const all = candidates(3);
+  const decision = await evaluateGate("task", all, options({
+    fetchImpl,
+    policy: "filter",
+    minKeep: 0,
+    maxDropFraction: 1
+  }));
+  assert.equal(decision.bounded, false);
+  assert.deepEqual(decision.dropped, all.map((c) => c.hash));
+  assert.deepEqual(decision.kept, []);
+});
+
+
+test("mem_search reranks by default: nothing is dropped and the best candidate leads", async () => {
+  const root = makeRepo();
+  const realFetch = globalThis.fetch;
+  try {
+    // No `policy` in the config: the shipped default must be `rerank`.
+    const tools = await pluginTools({
+      projectRoot: root,
+      systemOne: {
+        enabled: true,
+        endpoint: "https://example.test/v1/systemone",
+        model: "jev-latest",
+        mode: "noul",
+        threshold: 0.5,
+        minKeep: 1,
+        apiKey: "test-key"
+      }
+    });
+    const exec = { agent: { session: { header: { cwd: root } } } };
+    const weak = await tools.mem_write.execute(
+      { title: "[gate] weakly related", summary: "background", keywords: ["rerankme", "rw"], content: "body" },
+      exec
+    );
+    const strong = await tools.mem_write.execute(
+      { title: "[gate] directly answers it", summary: "the answer", keywords: ["rerankme", "rs"], content: "body" },
+      exec
+    );
+    globalThis.fetch = async (url, request) => {
+      const body = JSON.parse(request.body);
+      const answers = {};
+      for (const [id, question] of Object.entries(body.questions)) {
+        const title = question.instructions.candidate.title;
+        answers[id] = { type: "noul", noul: title.includes("directly answers") ? 0.91 : 0.02 };
+      }
+      return { ok: true, status: 200, json: async () => ({ answers, usage: { input_tokens: 5, output_tokens: 2 } }) };
+    };
+
+    const result = await tools.mem_search.execute({ keywords: ["rerankme"] }, exec);
+    assert.equal(result.gated.policy, "rerank");
+    assert.equal(result.gated.dropped, 0, "the reranker must not remove a memory");
+    assert.deepEqual(result.gated.dropped_hashes, []);
+    assert.equal(result.results.length, 2);
+    assert.equal(result.results[0].hash, strong.hash, "the better-judged memory must come first");
+    assert.equal(result.results[1].hash, weak.hash);
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a filter policy is bounded in the tool too: a page is never gutted", async () => {
+  const root = makeRepo();
+  const realFetch = globalThis.fetch;
+  try {
+    const tools = await pluginTools({
+      projectRoot: root,
+      systemOne: {
+        enabled: true,
+        endpoint: "https://example.test/v1/systemone",
+        model: "jev-latest",
+        mode: "noul",
+        threshold: 0.9, // nothing will clear this
+        minKeep: 0,
+        policy: "filter",
+        maxDropFraction: 0,
+        apiKey: "test-key"
+      }
+    });
+    const exec = { agent: { session: { header: { cwd: root } } } };
+    await tools.mem_write.execute(
+      { title: "[gate] bounded one", summary: "s", keywords: ["boundedk", "b1"], content: "body" },
+      exec
+    );
+    await tools.mem_write.execute(
+      { title: "[gate] bounded two", summary: "s", keywords: ["boundedk", "b2"], content: "body" },
+      exec
+    );
+    globalThis.fetch = async (url, request) => {
+      const body = JSON.parse(request.body);
+      const answers = {};
+      // minKeep 0 so only the bound can prevent an empty page. The endpoint
+      // sends the 0.0 itself, i.e. the model is free to say "keep nothing".
+      for (const [id, question] of Object.entries(body.questions)) {
+        answers[id] = { type: "noul", noul: question.instructions.candidate.title.includes("bounded one") ? 0.0 : 0.0 };
+      }
+      return { ok: true, status: 200, json: async () => ({ answers, usage: { input_tokens: 5, output_tokens: 2 } }) };
+    };
+    const result = await tools.mem_search.execute({ keywords: ["boundedk"] }, exec);
+    assert.equal(result.gated.policy, "filter");
+    assert.equal(result.gated.dropped, 0, "maxDropFraction 0 must forbid every drop");
+    assert.equal(result.gated.bounded, true);
+    assert.equal(result.results.length, 2);
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });

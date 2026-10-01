@@ -54,6 +54,15 @@ export interface GateOptions {
     scoreMin: number;
     /** Retain at least this many candidates when the model rejects the whole page. */
     minKeep: number;
+    /** What the caller does with the values; see {@link GatePolicy}. */
+    policy?: GatePolicy;
+    /**
+     * `filter` policy only: never drop more than this fraction of the judged page,
+     * lowest-scoring first. Bounds the damage a mis-calibrated threshold can do —
+     * an offline sweep kept recall_all@5 at 0.8875 with a 20 % cap, against 0.6875
+     * uncapped. Default 0.25.
+     */
+    maxDropFraction?: number;
     /** Never send more than this many candidates in one request. */
     maxCandidates: number;
     /** Truncate the task text to this many characters. */
@@ -96,6 +105,16 @@ export interface GateDecision {
     dropped: string[];
     /** Per-candidate verdicts, in candidate order. */
     verdicts: GateVerdict[];
+    /** Policy actually applied; see {@link GatePolicy}. */
+    policy: GatePolicy;
+    /** True when `maxDropFraction` restored candidates a threshold would have removed. */
+    bounded: boolean;
+    /**
+     * Candidate hashes ordered by the judge's value, best first (nulls last and
+     * kept stable). This is what the `rerank` policy applies; in `filter` mode it
+     * is still reported so a caller can log or inspect the judge's ordering.
+     */
+    ordered: string[];
     /** Question type actually used. */
     mode: SystemOneMode;
     /** Model identifier the request named. */
@@ -142,6 +161,23 @@ export declare const NOUL_CRITERIA: {
 };
 /** The judgement asked of the model in `score` mode. */
 export declare const SCORE_INSTRUCTION = "How relevant is the `candidate` memory record to the `task`? Rate how reusable its conclusions, decisions, constraints, or findings are for this exact task.";
+/**
+ * What the caller does with the judge's values.
+ *
+ * - `rerank` (default): keep every judged candidate and let the values reorder
+ *   the page. Cannot lose a memory by construction.
+ * - `filter`: drop candidates below the threshold, then apply `maxDropFraction`.
+ *
+ * Measured on LongMemEval `_S` (500 questions, identical ingested memories): at
+ * threshold 0.5 the filter held 343 gold memories out of the prompt across 254
+ * instances and took LLM-as-Judge from 0.7840 to 0.3800, while the same values
+ * used as a reranker scored 0.8020 on the same context. The judge's AUC is only
+ * ~0.71-0.75, so no threshold can make a hard drop safe; the same signal is a
+ * fine ordering feature. See evals/longmemeval/README.md.
+ */
+export type GatePolicy = "rerank" | "filter";
+/** Accepted `policy` values, for config validation and tool schemas. */
+export declare const GATE_POLICIES: readonly GatePolicy[];
 /**
  * Build the System-one request body: the task is the shared `state`, and each
  * candidate travels inside its own question's structured `instructions`, so
@@ -192,11 +228,12 @@ export declare function parseUsage(payload: unknown): GateUsage | undefined;
  * @param options - resolved gate settings.
  * @returns kept/dropped hash lists and per-candidate verdicts.
  */
-export declare function decide(candidates: readonly GateCandidate[], values: ReadonlyArray<number | undefined>, options: Pick<GateOptions, "mode" | "threshold" | "scoreMin" | "minKeep">): {
+export declare function decide(candidates: readonly GateCandidate[], values: ReadonlyArray<number | undefined>, options: Pick<GateOptions, "mode" | "threshold" | "scoreMin" | "minKeep" | "policy" | "maxDropFraction">): {
     kept: string[];
     dropped: string[];
     verdicts: GateVerdict[];
     floored: boolean;
+    bounded: boolean;
 };
 /**
  * Evaluate the gate for one search page.
