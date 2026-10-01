@@ -222,6 +222,28 @@ category off; measuring both layers shows why it must not be.
 GPT-4o; this run is judged by DeepSeek's flash tier, so 0.7860 is an internal, reproducible
 baseline to iterate against, not a leaderboard claim. The judge is part of the measurement.
 
+### The System-one gate, measured through the pipeline
+
+With the gate wired into `mem_search` exactly as the plugin applies it, on the
+identical ingested memories:
+
+| Arm | configuration | LLM-as-Judge | context tokens |
+| --- | --- | --- | --- |
+| baseline | `idf` ingestion, no gate | 0.7860 | 19 030 |
+| A | `llm` ingestion, no gate | 0.7840 | 16 426 |
+| B | as A, gate **filtering** at t=0.5 (shipped) | **0.3800** | **3 862** |
+| C | as A, gate **reranking** (`GITMEMO_LME_GATE_RERANK=1`) | **0.8020** | 16 426 |
+
+Filtering cuts context by 80 % and accuracy by 52 % — the accuracy cost the
+retrieval harness predicts. Reranking cannot drop a memory by construction, so it
+keeps accuracy and gains a little, at the price of the context saving. The offline
+sweep in `../longmemeval/README.md` shows why: the judge's AUC is ~0.71–0.75, so no
+threshold is safe, but the same value is a usable ordering feature. A bounded
+filter (never drop more than 20 % of a page) is the untested middle ground.
+
+`GITMEMO_LME_GATE_RERANK` defaults to `1`; set it to `0` to reproduce the shipped
+filtering behaviour.
+
 ### The judge parser patch (and why it is here)
 
 Upstream `0b1ea8d` is internally inconsistent: `JUDGE_PROMPT` instructs the judge to *"provide a

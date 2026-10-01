@@ -101,7 +101,15 @@ export async function describeItem(item, { ingestMode, stats, client, maxKeyword
       "record concrete specifics (names, objects, activities, decisions), not just the topic.\n\n" +
       "Interaction:\n" +
       text.slice(0, 6000);
-    const raw = await client.chatJson([{ role: "user", content: prompt }], { maxTokens: 300 });
+    // Unparseable replies fall back to the deterministic metadata rather than
+    // failing the item; a hard API error (status set) still propagates.
+    let raw;
+    try {
+      raw = await client.chatJson([{ role: "user", content: prompt }], { maxTokens: 300 });
+    } catch (error) {
+      if (Number(error?.status ?? 0) > 0) throw error;
+      raw = {};
+    }
     const keywords = (Array.isArray(raw.keywords) ? raw.keywords : [])
       .map((k) => String(k).trim().toLowerCase())
       .filter((k) => k.length > 0 && k.length <= 64)
@@ -190,7 +198,19 @@ export async function searchHashes(memo, keywords, { topK = 50, task, gate } = {
       const kept = new Set(decision.kept);
       gateDropped += page.results.filter((hit) => !kept.has(hit.hash)).length;
       gate.onDecision?.(decision, page.results);
-      results = page.results.filter((hit) => kept.has(hit.hash));
+      if (gate.rerank === true) {
+        // RERANK, not filter: the judge's value only reorders the page, so no
+        // memory can be lost by construction. The gate study showed this is the
+        // difference between the signal helping and destroying recall — an
+        // AUC of ~0.75 cannot be thresholded safely at any cutoff, but it can
+        // be used as an ordering feature.
+        const value = new Map(decision.verdicts.map((v) => [v.hash, v.value]));
+        results = [...page.results].sort(
+          (a, b) => (value.get(b.hash) ?? -1) - (value.get(a.hash) ?? -1)
+        );
+      } else {
+        results = page.results.filter((hit) => kept.has(hit.hash));
+      }
     }
     for (const hit of results) hashes.push(hit.hash);
     skip += page.results.length;

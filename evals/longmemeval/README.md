@@ -224,6 +224,12 @@ turn→session collapse path): **7 200 compared values, zero divergence.**
 
 ## 5. Results
 
+Four end-to-end pipeline arms and the gate study are below; the short version is
+that the engine's ranking improvements move the *retrieval* metrics but not the
+end-to-end QA score, that the gate shipping as a filter halves accuracy, and that
+using the same gate as a reranker is the best configuration measured so far
+(0.8020 vs a 0.7860 baseline, on identical ingested memories).
+
 **`_S`, all 500 instances, session granularity, `idf` ingestion / `plain` queries — 500/500 scored,
 zero failures, 507 s.** Commands:
 
@@ -310,6 +316,64 @@ Per type at turn granularity, `gitmemo` `recall_all@10`: `single-session-assista
 session granularity. A stated preference is usually spread across a conversation rather than
 localised in one turn, so splitting the session discards the context that made it retrievable.
 Granularity is a per-question-type tradeoff, not a global win.
+
+### The System-one gate: a filter destroys recall, a reranker improves it
+
+`gate_study.mjs` records, for every candidate on a real search page, the judge's
+value under five request variants together with its gold label. Decision rules
+are then swept **offline** over those recorded values, so only the request axis
+costs model calls. 80 seeded instances, page 1, 98 gold / 408 non-gold candidates:
+
+| Request variant | AUC | mean value: gold / non-gold | best hard filter (recall_all@5) |
+| --- | --- | --- | --- |
+| objective question · projections (**shipped**) | 0.7124 | 0.302 / 0.126 | 0.850 (t=0.6) |
+| objective question · + 1200-char body | 0.6526 | 0.363 / 0.233 | 0.7625 (t=0.7) |
+| **answerability question · projections** | **0.7466** | 0.505 / 0.237 | 0.825 (t=0.1) |
+| answerability question · + 1200-char body | 0.6534 | 0.499 / 0.337 | 0.925 (t=0.1) |
+| answerability question · chunked body, best window | 0.6460 | 0.444 / 0.280 | 0.950 (t=0.6) |
+
+No gate on the same sample: `recall_all@5` 0.8875, `recall_all@10` 1.000.
+
+Three conclusions, one of which contradicts the obvious hypothesis:
+
+1. **The decision rule is the lever, not the threshold.** The gate's AUC is ~0.71–0.75 —
+   no threshold on that signal can be safe. `rerank` (keep everything, order by the
+   judge's value) cannot lose a memory by construction and slightly *beats* no gate;
+   every hard filter loses ground, and the shipped t=0.5 rule loses the most.
+2. **Re-phrasing the question is free and helps** (AUC 0.7124 → 0.7466). The shipped
+   `NOUL_INSTRUCTION` asks whether a memory holds "conclusions ... directly relevant to
+   the task" and answers no "when it is merely on a related topic" — a question about
+   reusing engineering knowledge, not about answerability. The answerability wording
+   also ran *faster* (114 ms vs 161 ms per page).
+3. **Feeding the body does NOT help — it dilutes.** Adding a 1200-char transcript
+   excerpt *lowered* separation (0.7124 → 0.6526), because it lifts the non-gold mean
+   (0.126 → 0.233) far more than the gold mean. The mechanism is a length effect, not
+   a semantic one: with the evidence placed at the end of a probe string, P(yes)
+   falls from 0.82 at 300 chars to 0.43 at 3000 and 0.12 at 8000. The gate is not
+   "blind to the body" so much as unable to pick evidence out of bulk.
+
+### End-to-end: the same change, measured through the pipeline
+
+Four pipeline arms on the identical ingested memories (500 questions, `--streaming 0`,
+`topk=20`, judge `deepseek-chat`):
+
+| Arm | configuration | LLM-as-Judge | context tokens | multi-session |
+| --- | --- | --- | --- | --- |
+| baseline | `idf` ingestion · `count` scoring · no gate | 0.7860 | 19 030 | 0.6165 |
+| A | `llm` ingestion · `weighted` scoring · no gate | 0.7840 | 16 426 | 0.6391 |
+| B | as A · gate **filtering** at t=0.5 (shipped) | **0.3800** | **3 862** | 0.1880 |
+| C | as A · gate **reranking** | **0.8020** | 16 426 | **0.6917** |
+
+Arm B is the trade the gate was designed to make — **−80 % context for −52 % accuracy**.
+Arm C keeps the accuracy *and* gains a little, because the judge's signal is used to
+order memory that is already going to be sent. Its best category is the one this
+harness flags as the engine's weakest: `multi-session` 0.6165 → 0.6917.
+
+Reranking forfeits the context saving, which is the gate's stated purpose. The
+middle ground the study supports is a **bounded** filter — `maxdrop_20pct` (never
+drop more than 20 % of a page, lowest-scoring first) held `recall_all@5` at 0.8875 /
+`recall_all@10` 0.9875 in the offline sweep, versus 0.6875/0.7125 for the shipped
+filter. It is the natural next arm to run end-to-end.
 
 ### Ablation: the ingestion policy is the dominant variable
 

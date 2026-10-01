@@ -50,6 +50,17 @@ from pathlib import Path
 from .base_client import env_int, env_str
 
 
+class BridgeAppError(RuntimeError):
+    """The bridge answered but the requested operation failed.
+
+    Deliberately distinct from a transport failure: an application error (a bad
+    write, an exhausted API balance, a rejected credential) is NOT a reason to
+    kill and respawn the bridge. Doing so hid the real message behind a restart
+    storm and multiplied one failure into thousands — observed as bridges living
+    2-7 seconds each while ingestion crawled.
+    """
+
+
 class _Bridge:
     """One persistent `bridge.mjs` process, safe for concurrent callers."""
 
@@ -142,16 +153,19 @@ class _Bridge:
                         if response.get("id") != request_id:
                             continue
                         if not response.get("ok"):
-                            raise RuntimeError(
+                            # application error: propagate verbatim, do NOT respawn
+                            raise BridgeAppError(
                                 f"gitmemo bridge {self.label} {cmd} failed: {response.get('error')}"
                             )
                         return response.get("result") or {}
+                except BridgeAppError:
+                    raise
                 except (BrokenPipeError, RuntimeError, TimeoutError) as exc:
                     if attempt == 1:
                         raise
                     detail = "\n".join(self._stderr[-8:])
                     print(
-                        f"  ⚠ gitmemo bridge {self.label} call failed ({exc}); restarting"
+                        f"  ⚠ gitmemo bridge {self.label} transport failure ({exc}); restarting"
                         + (f"\n{detail}" if detail else "")
                     )
                     self._terminate()

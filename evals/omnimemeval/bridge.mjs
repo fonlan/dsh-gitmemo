@@ -26,7 +26,16 @@ import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { createMemoRoot, ENGINE_PATH, removeMemoRoot, searchHashes } from "../longmemeval/lib/ingest.mjs";
 import { ChatClient } from "../longmemeval/lib/llm.mjs";
-import { contentTokens, idfFromDf, ingestKeywords, queryKeywords, summarize, titleize } from "../longmemeval/lib/text.mjs";
+import {
+  contentTokens,
+  extractiveSummary,
+  idfFromDf,
+  ingestKeywords,
+  queryKeywords,
+  sanitizeForEngine,
+  summarize,
+  titleize
+} from "../longmemeval/lib/text.mjs";
 import { formatMemory } from "../longmemeval/lib/format.mjs";
 
 const env = (name, fallback) => {
@@ -62,6 +71,12 @@ const CONFIG = {
     minKeep: Number(env("GITMEMO_LME_GATE_MIN_KEEP", "1")),
     maxCandidates: Number(env("GITMEMO_LME_GATE_MAX_CANDIDATES", "20")),
     maxTaskChars: Number(env("GITMEMO_LME_GATE_MAX_TASK_CHARS", "2000")),
+    /**
+     * `rerank` (recommended) keeps every judged candidate and lets the judge's
+     * value reorder the page; `filter` drops candidates below the threshold —
+     * the shipped behaviour, measured to destroy recall on LongMemEval.
+     */
+    rerank: env("GITMEMO_LME_GATE_RERANK", "1") === "1",
     timeoutMs: Number(env("GITMEMO_LME_GATE_TIMEOUT", "60000")),
     apiKey: env("GITMEMO_LME_GATE_API_KEY", "local")
   }
@@ -146,7 +161,27 @@ function renderContent({ messages, sessionId, timestamp }) {
   return lines.join("\n");
 }
 
+/** Record and rethrow a hard LLM failure (bad credential, no balance). */
+async function guardHardLlmError(fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    const status = Number(error?.status ?? 0);
+    if (status === 401 || status === 402 || status === 403) llmFatalError = error;
+    throw error;
+  }
+}
+
+/**
+ * Circuit breaker for hard LLM failures. A rejected credential or an exhausted
+ * balance ("HTTP 402 Insufficient Balance") will not fix itself, so once one is
+ * seen every later LLM write fails immediately with that same message instead
+ * of repeating it thousands of times over the whole benchmark.
+ */
+let llmFatalError;
+
 async function describeSession({ messages, sessionId, stats }) {
+  if (llmFatalError) throw llmFatalError;
   const text = retrievalText(messages);
   if (CONFIG.ingestKeywords === "llm") {
     const prompt =
@@ -158,28 +193,36 @@ async function describeSession({ messages, sessionId, stats }) {
       "literal terms (names, places, objects, activities) over whole sentences or generic words.\n\n" +
       "Session (id " + String(sessionId) + "):\n" + text.slice(0, 12000);
     const chat = await llm();
-    const raw = await chat.chatJson([{ role: "user", content: prompt }], { maxTokens: 300 });
+    // A judge reply that is not JSON (the model echoed the transcript, or
+    // emitted prose) must degrade to the deterministic metadata, not abort the
+    // session: one bad reply previously failed a whole 500-conversation step.
+    let raw;
+    try {
+      raw = await guardHardLlmError(() => chat.chatJson([{ role: "user", content: prompt }], { maxTokens: 300 }));
+    } catch (error) {
+      if (Number(error?.status ?? 0) > 0) throw error; // a hard API error is not a formatting problem
+      process.stderr.write(`bridge: unparseable LLM metadata for ${sessionId}, falling back to the heuristic: ${String(error?.message ?? error).slice(0, 120)}\n`);
+      raw = {};
+    }
     const keywords = (Array.isArray(raw.keywords) ? raw.keywords : [])
       .map((k) => String(k).trim().toLowerCase())
       .filter((k) => k.length > 0 && k.length <= 64)
       .slice(0, CONFIG.maxIngestKeywords);
     const fallbackKeywords = ingestKeywords(text, stats, CONFIG.maxIngestKeywords, { score: CONFIG.keywordScore });
-    const { extractiveSummary: summarizeExtractive } = await import("../longmemeval/lib/text.mjs");
-    const fallbackSummary = summarizeExtractive(text, stats).trim() || "(empty session)";
+    const fallbackSummary = extractiveSummary(text, stats).trim() || "(empty session)";
     return {
       title: String(raw.title ?? titleize(text)).replace(/[\r\n]+/g, " ").slice(0, 200) || titleize(text),
       summary: String(raw.summary ?? fallbackSummary).replace(/\s+/g, " ").slice(0, 1000) || fallbackSummary,
       keywords: keywords.length >= 2 ? keywords : fallbackKeywords
     };
   }
-  const { titleize, summarize, extractiveSummary, ingestKeywords: extract } = await import("../longmemeval/lib/text.mjs");
   const summaryText = (CONFIG.summaryMode === "prefix" ? summarize(text) : extractiveSummary(text, stats)).trim();
   return {
     title: titleize(text),
     // mem_write rejects an empty summary; a session can legitimately be empty
     // once its blank turns are dropped.
     summary: summaryText.length > 0 ? summaryText : "(empty session)",
-    keywords: extract(text, stats, CONFIG.maxIngestKeywords, { score: CONFIG.keywordScore })
+    keywords: ingestKeywords(text, stats, CONFIG.maxIngestKeywords, { score: CONFIG.keywordScore })
   };
 }
 
@@ -191,7 +234,7 @@ async function queryKeywordsFor(query, user) {
       "short literal topical terms or names a memory entry would plausibly contain verbatim — not sentences, not stopwords.\n" +
       'Reply with STRICT JSON only: {"keywords": ["..."]}\n\nQuestion: ' + query;
     const chat = await llm();
-    const raw = await chat.chatJson([{ role: "user", content: prompt }], { maxTokens: 200 });
+    const raw = await guardHardLlmError(() => chat.chatJson([{ role: "user", content: prompt }], { maxTokens: 200 }));
     const kws = (Array.isArray(raw.keywords) ? raw.keywords : [])
       .map((k) => String(k).trim().toLowerCase())
       .filter((k) => k.length > 0 && k.length <= 64)
@@ -215,7 +258,6 @@ async function cmdAdd({ user_id, session_id, messages, timestamp }) {
   const fields = await describeSession({ messages: clean, sessionId: session_id, stats: statsOf(user) });
   // The engine rejects control bytes in title / summary / content, and scraped
   // chat transcripts carry them; cleaning is the adapter's job.
-  const { sanitizeForEngine } = await import("../longmemeval/lib/text.mjs");
   const content = sanitizeForEngine(renderContent({ messages: clean, sessionId: session_id, timestamp }));
   const metadata = {
     title: sanitizeForEngine(fields.title),
@@ -257,6 +299,7 @@ async function cmdSearch({ user_id, query, top_k }) {
         maxTaskChars: CONFIG.gate.maxTaskChars,
         timeoutMs: CONFIG.gate.timeoutMs,
         apiKey: CONFIG.gate.apiKey,
+        rerank: CONFIG.gate.rerank,
         onDecision: (decision) => {
           if (decision.degraded) {
             process.stderr.write(`bridge: gate DEGRADED for ${user_id}: ${decision.reason ?? "unknown"}\n`);

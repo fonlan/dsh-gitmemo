@@ -167,7 +167,17 @@ export class ChatClient {
           });
           if (!res.ok) {
             const text = await res.text().catch(() => "");
-            throw new Error(`llm: HTTP ${res.status} ${text.slice(0, 300)}`);
+            const retryable = res.status === 429 || res.status >= 500;
+            const hint =
+              res.status === 402
+                ? " (the provider account is out of credit — top it up or point --base-url at another endpoint)"
+                : res.status === 401 || res.status === 403
+                  ? " (the credential was rejected — check the key/endpoint pair)"
+                  : "";
+            const error = new Error(`llm: HTTP ${res.status} ${text.slice(0, 300)}${hint}`);
+            error.status = res.status;
+            error.retryable = retryable;
+            throw error;
           }
           const json = await res.json();
           const content = json?.choices?.[0]?.message?.content ?? "";
@@ -179,6 +189,10 @@ export class ChatClient {
           return content;
         } catch (error) {
           lastError = error;
+          // A rejected credential or an exhausted balance will not fix itself:
+          // retrying turns one clear failure into thousands of them. Only
+          // rate limits, 5xx and network faults are worth another attempt.
+          if (error?.retryable === false) throw error;
           const delay = 500 * 2 ** attempt + Math.floor(Math.random() * 250);
           await new Promise((r) => setTimeout(r, delay));
         }
