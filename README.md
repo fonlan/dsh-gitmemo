@@ -193,23 +193,6 @@ what writes it (the switch alone is a draft). An absent `enabled` reads as on, s
 an unconfigured section shows the gate as enabled — which is what the host
 default does.
 
-### Known trade-offs
-
-- **English-first.** Jev's primary training language is English; CJK works but
-  the vendor documents lower accuracy. The gate's question wording is English;
-  only the candidate text and task text may be Chinese.
-- **Context ceiling.** 64k tokens per request, of which `state` + the longest
-  single question may use 32k. `maxCandidates` and `maxTaskChars` exist to hold
-  that line.
-- **Latency on the critical path.** Recall runs before every repo task, and the
-  gate adds one network round trip (~0.4s observed), so `timeoutMs` defaults to
-  8s and every failure path fails open.
-- **Data egress.** Memory summaries leave the machine. TypeSafe currently offers
-  **no** zero data retention; point `endpoint` at a self-hosted implementation
-  (e.g. MIT-licensed `jeff`) or a local endpoint to avoid egress entirely.
-- **Billing.** Priced per input token ($0.042 per million input tokens, output
-  free) — not per call.
-
 ## Memory Location & Format
 
 The `.mem` repository lives at the **project root** of the calling session's workspace
