@@ -22,6 +22,14 @@ export const zh = {
   endpointHint: '接受 System-one 请求契约的 HTTP 端点；留空表示恢复默认地址。',
   model: '模型',
   modelHint: '请求体中携带的模型标识；留空表示恢复默认模型。',
+  policy: '判定结果的用法',
+  policyHint:
+    '重排：保留全部候选，仅按判定分值排序本页，不可能丢记忆。过滤：丢弃低于阈值的候选，可缩减上下文，但实测准确率代价很大（同一批记忆、同一组分值：重排 0.8020，过滤 0.3800）。',
+  policyRerank: '重排',
+  policyFilter: '过滤',
+  maxDropFraction: '单页最大丢弃比例',
+  maxDropFractionHint:
+    '仅「过滤」生效：单页最多丢弃此比例的候选，从最低分开始丢，取值 0–1，默认 0.25。留空恢复默认。',
   apiKey: 'API Key',
   apiKeyHint: '凭据不写入设置文件。留空表示保持当前密钥。',
   apiKeySet: '已配置密钥。',
@@ -47,6 +55,14 @@ export const en: Record<keyof typeof zh, string> = {
   endpointHint: 'HTTP endpoint accepting the System-one request contract; blank restores the default.',
   model: 'Model',
   modelHint: 'Model identifier sent in the request body; blank restores the default.',
+  policy: 'How the judgement is used',
+  policyHint:
+    'Re-rank keeps every candidate and orders the page by the judge\u2019s value — it cannot lose a memory. Filter drops those below the threshold, which shrinks context but cost accuracy in measurement: same memories and same values scored 0.8020 re-ranked against 0.3800 filtered.',
+  policyRerank: 'Re-rank',
+  policyFilter: 'Filter',
+  maxDropFraction: 'Max drop share per page',
+  maxDropFractionHint:
+    'Filter only: at most this share of a judged page may be dropped, lowest-scoring first, between 0 and 1, default 0.25. Blank restores the default.',
   apiKey: 'API key',
   apiKeyHint: 'Stored outside the settings file. Leave blank to keep the current key.',
   apiKeySet: 'A key is configured.',

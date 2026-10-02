@@ -12,7 +12,14 @@
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SettingsFieldState, SettingsFormActions, SettingsFormScope, SettingsFormShell } from '@deepseek-ai/dsh-client-ui-primitives'
-import { GitMemoFormModel, pathBooleanField, pathTextField, type GitMemoSettings } from './form-model'
+import {
+  GitMemoFormModel,
+  pathBooleanField,
+  pathBoundedNumberField,
+  pathChoiceField,
+  pathTextField,
+  type GitMemoSettings
+} from './form-model'
 
 /**
  * Settings namespace of this plugin. Spelled here rather than imported: a
@@ -35,6 +42,10 @@ export interface GitMemoCardState extends SettingsFormShell {
   endpoint: SettingsFieldState
   /** Model identifier sent in the request body. */
   model: SettingsFieldState
+  /** How the judge's values are used: order the page, or drop from it. */
+  policy: SettingsFieldState
+  /** `filter` only: the share of a judged page that may be dropped. */
+  maxDropFraction: SettingsFieldState
   /** The staged credential, which starts blank on every load. */
   apiKey: SettingsFieldState
   /** Whether the Host reports a credential configured for the referenced key. */
@@ -82,7 +93,15 @@ export class GitMemoSettingsController {
       [
         pathBooleanField('enabled', ['systemOne', 'enabled']),
         pathTextField('endpoint', ['systemOne', 'endpoint']),
-        pathTextField('model', ['systemOne', 'model'])
+        pathTextField('model', ['systemOne', 'model']),
+        // The values and the default mirror `src/index.ts`'s schema: an absent
+        // field must render as the value actually in force, not as blank.
+        pathChoiceField('policy', ['systemOne', 'policy'], ['rerank', 'filter'], 'rerank'),
+        pathBoundedNumberField('maxDropFraction', ['systemOne', 'maxDropFraction'], {
+          min: 0,
+          max: 1,
+          declaredDefault: '0.25'
+        })
       ],
       [{ field: API_KEY_FIELD, write: (text) => this.writeKey(text) }]
     )
@@ -147,6 +166,8 @@ export class GitMemoSettingsController {
       enabled: this.form.field('enabled'),
       endpoint: this.form.field('endpoint'),
       model: this.form.field('model'),
+      policy: this.form.field('policy'),
+      maxDropFraction: this.form.field('maxDropFraction'),
       apiKey: this.form.field(API_KEY_FIELD),
       apiKeyConfigured: this.credential.configured,
       apiKeyWritable: this.credential.writable

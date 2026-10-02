@@ -8,7 +8,7 @@
  * `SettingsSecretField` kit, so this page behaves exactly like a shipped one.
  */
 
-import { Button, SettingsForm, SettingsSecretField, SettingsValueField, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, SegmentedControl, SettingsForm, SettingsSecretField, SettingsValueField, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsFieldProps, SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { LOCALE_NS } from './locales'
@@ -57,6 +57,61 @@ function SettingsSwitchField(props: SettingsSwitchFieldProps): JSX.Element {
             </>
           ) : null}
           <Switch checked={checked} onChange={onEdit} label={label} disabled={disabled} />
+        </span>
+      </div>
+      <p id={`${id}-hint`} style={{ margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>
+        {hint}
+      </p>
+    </div>
+  )
+}
+
+/**
+ * Render one labelled choice field: the same chrome as
+ * {@link SettingsSwitchField}, with the shipped `SegmentedControl` as the
+ * control. Used for a small closed set of string values, where a switch would
+ * misrepresent the field as boolean.
+ */
+interface SettingsChoiceFieldProps
+  extends Omit<SettingsFieldProps, 'text' | 'invalid' | 'invalidLabel' | 'onEdit'> {
+  /** The option currently in force. */
+  value: string
+  /** The options in display order, value plus localized label. */
+  options: ReadonlyArray<{ value: string; label: string }>
+  /** Stage the chosen option. */
+  onEdit: (next: string) => void
+  /** Localized accessible name for the tablist. */
+  controlLabel: string
+}
+
+/**
+ * Render one labelled segmented field.
+ * @param props - the field's copy, its staged value, the options, and the edit actions.
+ * @returns the labelled control.
+ */
+function SettingsChoiceField(props: SettingsChoiceFieldProps): JSX.Element {
+  const { id, label, hint, value, options, controlLabel, overridden, overriddenLabel, resetLabel, disabled, onEdit, onReset } = props
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--dsw-alias-label-primary)' }}>{label}</span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {overridden ? (
+            <>
+              <Tag tone="neutral">{overriddenLabel}</Tag>
+              <Button variant="ghost" size="sm" type="button" disabled={disabled} onClick={onReset}>
+                {resetLabel}
+              </Button>
+            </>
+          ) : null}
+          <SegmentedControl
+            id={id}
+            value={value}
+            options={options}
+            onChange={onEdit}
+            label={controlLabel}
+            disabled={disabled}
+          />
         </span>
       </div>
       <p id={`${id}-hint`} style={{ margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>
@@ -145,6 +200,46 @@ export function GitMemoSettingsSection(props: GitMemoSettingsSectionProps): JSX.
         }}
         onReset={() => {
           resetField('model')
+        }}
+      />
+      <SettingsChoiceField
+        id="dsh-gitmemo-systemone-policy"
+        label={t('policy')}
+        hint={t('policyHint')}
+        controlLabel={t('policy')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={sectionDisabled}
+        /* An absent value means the declared default (rerank), so the draft is
+           seeded with it rather than left blank — see the form model. */
+        value={state.policy.text}
+        options={[
+          { value: 'rerank', label: t('policyRerank') },
+          { value: 'filter', label: t('policyFilter') }
+        ]}
+        overridden={state.policy.overridden}
+        onEdit={(next) => {
+          edit('policy', next)
+        }}
+        onReset={() => {
+          resetField('policy')
+        }}
+      />
+      <SettingsValueField
+        id="dsh-gitmemo-systemone-maxdrop"
+        label={t('maxDropFraction')}
+        hint={t('maxDropFractionHint')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={sectionDisabled}
+        numeric
+        {...state.maxDropFraction}
+        onEdit={(text) => {
+          edit('maxDropFraction', text)
+        }}
+        onReset={() => {
+          resetField('maxDropFraction')
         }}
       />
       <SettingsSecretField

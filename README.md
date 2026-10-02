@@ -184,14 +184,21 @@ settings plane to see the entry and apply edits live.
 ### Settings page
 
 The plugin ships a settings card (**Settings → GitMemo**) where the gate can be
-switched on and off and the endpoint, model and API key can be filled in
-directly, applying immediately with no restart. The API key is written through
-the credentials domain — it is **never persisted as a plaintext config value** —
-and the form is write-only. The switch stages `systemOne.enabled`; turning it off
-leaves recall byte-for-byte as it was before the gate existed, and a **Save** is
-what writes it (the switch alone is a draft). An absent `enabled` reads as on, so
-an unconfigured section shows the gate as enabled — which is what the host
-default does.
+switched on and off, its `policy` chosen between **Re-rank** and **Filter**, and
+`maxDropFraction`, the endpoint, the model and the API key filled in directly,
+applying immediately with no restart. The API key is written through the
+credentials domain — it is **never persisted as a plaintext config value** — and
+the form is write-only. Every control stages a draft and a **Save** is what
+writes it; turning the gate off leaves recall byte-for-byte as it was before the
+gate existed.
+
+Fields the section does not carry render the value `src/index.ts` declares rather
+than a blank control — an absent `enabled` reads as on, an absent `policy` reads
+as `rerank`, an absent `maxDropFraction` as `0.25` — because a blank control would
+misreport the configuration actually in force. A draft the field does not accept
+(for example a `maxDropFraction` outside 0–1) **blocks the save** instead of being
+silently dropped, and the settings card's defaults are asserted against the host
+schema by `test/form-specs.test.mjs` so the two cannot drift apart.
 
 ## Memory Location & Format
 

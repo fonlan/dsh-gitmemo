@@ -21,7 +21,6 @@
 
 import type {
   SettingsFieldState,
-  SettingsFieldWrite,
   SettingsFormPathOp,
   SettingsFormScope,
   SettingsFormScopeSnapshot,
@@ -29,110 +28,15 @@ import type {
   SettingsSecretSpec
 } from '@deepseek-ai/dsh-client-ui-primitives'
 
-/** The editable projection of this plugin's settings namespace. */
-export interface GitMemoSettings {
-  /** The System-one recall gate, as `src/index.ts` declares it. */
-  systemOne?: {
-    enabled?: boolean
-    endpoint?: string
-    model?: string
-    apiKey?: string
-    apiKeyEnv?: string
-    mode?: 'noul' | 'score'
-    threshold?: number
-    scoreMin?: number
-    minKeep?: number
-    maxCandidates?: number
-    maxTaskChars?: number
-    timeoutMs?: number
-  }
-}
-
-/** How one section field converts between its stored value and its draft text. */
-export interface PathFieldSpec {
-  /** Key addressing this control inside the card's form. */
-  field: string
-  /** Path inside the namespace section this control edits. */
-  path: readonly string[]
-  /** Render a stored value as draft text; the empty string when the section carries none. */
-  format: (value: unknown) => string
-  /** The write this draft text stages, or undefined when the text is not a value this field accepts. */
-  parse: (text: string) => SettingsFieldWrite | undefined
-}
 
 /**
- * A free-text field. An empty draft clears the field, so emptying the control
- * and saving is the same gesture as resetting it.
- * @param field - key addressing this control inside the card's form.
- * @param path - path of the field inside the namespace section.
- * @returns the field's conversion spec.
+ * The field vocabulary lives in `form-specs.ts` so it can be unit-tested without
+ * the browser bundle; re-exported here so the card and controller keep one import.
  */
-export function pathTextField(field: string, path: readonly string[]): PathFieldSpec {
-  return {
-    field,
-    path,
-    format: (value) => (typeof value === 'string' ? value : ''),
-    parse: (text) => {
-      const trimmed = text.trim()
-      return trimmed === '' ? { kind: 'clear' } : { kind: 'set', value: trimmed }
-    }
-  }
-}
-
-/**
- * A whole-number field. An empty draft clears the field; any other draft that
- * is not a finite number blocks the save.
- * @param field - key addressing this control inside the card's form.
- * @param path - path of the field inside the namespace section.
- * @returns the field's conversion spec.
- */
-export function pathNumberField(field: string, path: readonly string[]): PathFieldSpec {
-  return {
-    field,
-    path,
-    format: (value) => (typeof value === 'number' ? String(value) : ''),
-    parse: (text) => {
-      const trimmed = text.trim()
-      if (trimmed === '') return { kind: 'clear' }
-      const parsed = Number(trimmed)
-      return Number.isFinite(parsed) ? { kind: 'set', value: parsed } : undefined
-    }
-  }
-}
-
-/**
- * Draft text a boolean field renders while the section carries no value.
- *
- * A missing boolean is not "unknown": `src/index.ts` declares
- * `systemOne.enabled` with `default(true)` and reads it back through
- * `liveValue(section.enabled, true)`, so an absent value means ENABLED. Rendering
- * an absent boolean as the empty string would show a disabled switch for a gate
- * that is actually running, so the draft is seeded with the declared default.
- */
-const ABSENT_BOOLEAN_TEXT = 'true'
-
-/**
- * A boolean field, staged as the `'true'`/`'false'` draft the card's switch
- * renders. An empty draft clears the field (re-inheriting the declared
- * default); any other draft that is not one of those two words blocks the save.
- * @param field - key addressing this control inside the card's form.
- * @param path - path of the field inside the namespace section.
- * @returns the field's conversion spec.
- */
-export function pathBooleanField(field: string, path: readonly string[]): PathFieldSpec {
-  return {
-    field,
-    path,
-    format: (value) => (typeof value === 'boolean' ? String(value) : ABSENT_BOOLEAN_TEXT),
-    parse: (text) => {
-      const trimmed = text.trim()
-      if (trimmed === '') return { kind: 'clear' }
-      if (trimmed === 'true') return { kind: 'set', value: true }
-      if (trimmed === 'false') return { kind: 'set', value: false }
-      return undefined
-    }
-  }
-}
+export * from './form-specs'
+// The model's own signatures name the spec type, so import it as well as
+// re-export it: `export *` makes it visible to consumers, not to this module.
+import type { PathFieldSpec } from './form-specs'
 
 /** One staged draft: what the user typed, and whether it stages a clear. */
 interface Staged {
