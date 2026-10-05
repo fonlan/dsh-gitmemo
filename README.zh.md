@@ -36,7 +36,7 @@
 
 ## 安装
 
-需要 dsh ≥ 0.1.0-rc.6 与 `git` CLI。
+需要 dsh ≥ 0.1.7-alpha.1（或 0.2.x）与 `git` CLI。
 
 从 npm 仓库（发布后）：
 

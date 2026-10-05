@@ -37,7 +37,7 @@ dependency, and no manual memory commands are ever needed.
 
 ## Installation
 
-Requires dsh ≥ 0.1.0-rc.6 and the `git` CLI.
+Requires dsh ≥ 0.1.7-alpha.1 (or 0.2.x) and the `git` CLI.
 
 From the npm registry (once published):
 
