@@ -2,6 +2,18 @@
 
 The compatibility line lists the DSH host range this version supports.
 
+## 0.5.3
+
+**Compatibility**: unchanged — dsh `^0.1.7-alpha.1 || ^0.2.0-rc.1 || ^0.2.1-alpha.1` — verified on dsh web `0.2.1-alpha.1`.
+
+**Fixed**
+- `mem_search` no longer fails the host's tool-output validation whenever the System-one gate runs. `cd96d07` (shipped in 0.5.0) made the gate report `gated.policy` and `gated.bounded`, but the tool's declared output schema (`additionalProperties: false`) declared neither — and the host validates every result against that schema before it reaches the model. Every gated search therefore ended as `invalid output: "value.gated.policy" is not a declared property (additionalProperties: false)`, so no page was ever delivered. Both fields are now declared (`policy` required, `bounded` optional).
+- Regression coverage: `test/tool-output-schema.test.mjs` runs the host's own `validateJsonSchemaValue` over the results of all five tools, including gated searches under both policies. Reverting the schema fix fails it with exactly the reported error.
+
+**Note**: the gate is opt-in (it needs a credential), which is why 0.5.0–0.5.2 shipped with it unusable.
+
+**Verified**: `build` / `typecheck` / `test` (141 pass, +3) all green; the rebuilt module was additionally loaded inside a running dsh web host, where a gated value carrying `policy` + `bounded` validated with zero violations.
+
 ## 0.5.2
 
 **Compatibility**: dsh `^0.1.7-alpha.1 || ^0.2.0-rc.1 || ^0.2.1-alpha.1` — verified on dsh web `0.2.1-alpha.1` and DSH Desktop `0.2.0-rc.2`.
