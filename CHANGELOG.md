@@ -2,6 +2,17 @@
 
 The compatibility line lists the DSH host range this version supports.
 
+## 0.5.4
+
+**兼容性**：dsh `^0.1.7-alpha.1 || ^0.2.0-rc.1 || ^0.2.1-alpha.1 || ^0.2.1-rc.2` —— 已在 DSH Desktop `0.2.1-rc.2` 上验证（隔离 profile 冷启动 `pass-timeout-alive`）；dsh web `0.2.1-alpha.2` 仍落在同一 peer 区间内（门禁离线求值 ADMITTED）。
+
+**变更**
+- 构建基线 `@deepseek-ai/*` 从 `0.2.1-alpha.1` 升到 `0.2.1-rc.2`（含 `@deepseek-ai/cordis` `4.0.5`、`@deepseek-ai/schemastery` `3.18.5`）。
+- 每个 `@deepseek-ai/dsh*` 的 `peerDependencies` 追加 `|| ^0.2.1-rc.2`。
+- 源码零改动：`0.2.1-alpha.1 → 0.2.1-rc.2` 的声明面变化未触及本插件消费的 API（typecheck 通过）。
+
+**验证**：`pnpm install` / `typecheck` / `build` / `test`（141 项）全部通过；隔离 profile 冷启动（真 `0.2.1-rc.2` 宿主）通过。
+
 ## 0.5.3
 
 **Compatibility**: unchanged — dsh `^0.1.7-alpha.1 || ^0.2.0-rc.1 || ^0.2.1-alpha.1` — verified on dsh web `0.2.1-alpha.1`.
