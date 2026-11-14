@@ -2,6 +2,17 @@
 
 The compatibility line lists the DSH host range this version supports.
 
+## 0.5.7
+
+**兼容性**：dsh `^0.1.7-alpha.1 || ^0.2.0-rc.1 || ^0.2.1-alpha.1 || ^0.2.1-rc.2 || ^0.2.1-rc.3 || ^0.2.1-rc.5 || ^0.2.2-rc.3` —— 已在 DSH Desktop `0.2.2-rc.3` 上验证（隔离 profile 冷启动通过）。
+
+**变更**
+- 构建基线 `@deepseek-ai/*` 从 `0.2.1-rc.5` 升到 `0.2.2-rc.3`（`@deepseek-ai/cordis` `4.1.0`、`@deepseek-ai/schemastery` `3.19.0`）。
+- 每个 `@deepseek-ai/dsh*` 的 `peerDependencies` 追加 `|| ^0.2.2-rc.3`，`@deepseek-ai/cordis` peer 提到 `^4.1.0`。
+- 源码零改动：0.2.2 的宿主变化（Cordis 4.1、tools 步级准入、Session 批量追加）未触及本插件消费的 API；`schemastery` 开发基线对齐 `3.19.0`（与 0.2.2 组合包一致，消除 `Config` 的 TS2742）。
+
+**验证**：`pnpm install` / `typecheck` / `build` / `test`（141 项）全部通过；隔离 profile 冷启动（真 `0.2.2-rc.3` 宿主）通过。
+
 ## 0.5.6
 
 **兼容性**：dsh `^0.1.7-alpha.1 || ^0.2.0-rc.1 || ^0.2.1-alpha.1 || ^0.2.1-rc.2 || ^0.2.1-rc.3 || ^0.2.1-rc.5` —— 已在 DSH Desktop `0.2.1-rc.5` 上验证（隔离 profile 冷启动 `pass-timeout-alive`）。
